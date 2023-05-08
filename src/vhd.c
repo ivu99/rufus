@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Virtual Disk Handling functions
- * Copyright © 2013-2016 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2023 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@
 #include <rpc.h>
 #include <time.h>
 
+#include "vhd.h"
 #include "rufus.h"
 #include "missing.h"
 #include "resource.h"
@@ -32,110 +33,7 @@
 #include "registry.h"
 #include "bled/bled.h"
 
-#define VHD_FOOTER_COOKIE					{ 'c', 'o', 'n', 'e', 'c', 't', 'i', 'x' }
-
-#define VHD_FOOTER_FEATURES_NONE			0x00000000
-#define VHD_FOOTER_FEATURES_TEMPORARY		0x00000001
-#define VHD_FOOTER_FEATURES_RESERVED		0x00000002
-
-#define VHD_FOOTER_FILE_FORMAT_V1_0			0x00010000
-
-#define VHD_FOOTER_DATA_OFFSET_FIXED_DISK	0xFFFFFFFFFFFFFFFFULL
-
-#define VHD_FOOTER_CREATOR_HOST_OS_WINDOWS	{ 'W', 'i', '2', 'k' }
-#define VHD_FOOTER_CREATOR_HOST_OS_MAC		{ 'M', 'a', 'c', ' ' }
-
-#define VHD_FOOTER_TYPE_FIXED_HARD_DISK		0x00000002
-#define VHD_FOOTER_TYPE_DYNAMIC_HARD_DISK	0x00000003
-#define VHD_FOOTER_TYPE_DIFFER_HARD_DISK	0x00000004
-
-#define WIM_MAGIC							0x0000004D4957534DULL	// "MSWIM\0\0\0"
-#define WIM_HAS_API_EXTRACT					1
-#define WIM_HAS_7Z_EXTRACT					2
-#define WIM_HAS_API_APPLY					4
-#define WIM_HAS_EXTRACT(r)					(r & (WIM_HAS_API_EXTRACT|WIM_HAS_7Z_EXTRACT))
-
-#define SECONDS_SINCE_JAN_1ST_2000			946684800
-
-#define INVALID_CALLBACK_VALUE				0xFFFFFFFF
-
-#define WIM_FLAG_RESERVED					0x00000001
-#define WIM_FLAG_VERIFY						0x00000002
-#define WIM_FLAG_INDEX						0x00000004
-#define WIM_FLAG_NO_APPLY					0x00000008
-#define WIM_FLAG_NO_DIRACL					0x00000010
-#define WIM_FLAG_NO_FILEACL					0x00000020
-#define WIM_FLAG_SHARE_WRITE				0x00000040
-#define WIM_FLAG_FILEINFO					0x00000080
-#define WIM_FLAG_NO_RP_FIX					0x00000100
-
-// Bitmask for the kind of progress we want to report in the WIM progress callback
-#define WIM_REPORT_PROGRESS					0x00000001
-#define WIM_REPORT_PROCESS					0x00000002
-#define WIM_REPORT_FILEINFO					0x00000004
-
-// From https://docs.microsoft.com/en-us/previous-versions/msdn10/dd834960(v=msdn.10)
-// as well as https://msfn.org/board/topic/150700-wimgapi-wimmountimage-progressbar/
-enum WIMMessage {
-	WIM_MSG = WM_APP + 0x1476,
-	WIM_MSG_TEXT,
-	WIM_MSG_PROGRESS,	// Indicates an update in the progress of an image application.
-	WIM_MSG_PROCESS,	// Enables the caller to prevent a file or a directory from being captured or applied.
-	WIM_MSG_SCANNING,	// Indicates that volume information is being gathered during an image capture.
-	WIM_MSG_SETRANGE,	// Indicates the number of files that will be captured or applied.
-	WIM_MSG_SETPOS,		// Indicates the number of files that have been captured or applied.
-	WIM_MSG_STEPIT,		// Indicates that a file has been either captured or applied.
-	WIM_MSG_COMPRESS,	// Enables the caller to prevent a file resource from being compressed during a capture.
-	WIM_MSG_ERROR,		// Alerts the caller that an error has occurred while capturing or applying an image.
-	WIM_MSG_ALIGNMENT,	// Enables the caller to align a file resource on a particular alignment boundary.
-	WIM_MSG_RETRY,		// Sent when the file is being reapplied because of a network timeout.
-	WIM_MSG_SPLIT,		// Enables the caller to align a file resource on a particular alignment boundary.
-	WIM_MSG_FILEINFO,	// Used in conjunction with WimApplyImages()'s WIM_FLAG_FILEINFO flag to provide detailed file info.
-	WIM_MSG_INFO,		// Sent when an info message is available.
-	WIM_MSG_WARNING,	// Sent when a warning message is available.
-	WIM_MSG_CHK_PROCESS,
-	WIM_MSG_SUCCESS     = 0,
-	WIM_MSG_ABORT_IMAGE = -1
-};
-
-/*
- * VHD Fixed HD footer (Big Endian)
- * http://download.microsoft.com/download/f/f/e/ffef50a5-07dd-4cf8-aaa3-442c0673a029/Virtual%20Hard%20Disk%20Format%20Spec_10_18_06.doc
- * NB: If a dymamic implementation is needed, check the GPL v3 compatible C++ implementation from:
- * https://sourceforge.net/p/urbackup/backend/ci/master/tree/fsimageplugin/
- */
-#pragma pack(push, 1)
-typedef struct vhd_footer {
-	char		cookie[8];
-	uint32_t	features;
-	uint32_t	file_format_version;
-	uint64_t	data_offset;
-	uint32_t	timestamp;
-	char		creator_app[4];
-	uint32_t	creator_version;
-	char		creator_host_os[4];
-	uint64_t	original_size;
-	uint64_t	current_size;
-	union {
-		uint32_t	geometry;
-		struct {
-			uint16_t	cylinders;
-			uint8_t		heads;
-			uint8_t		sectors;
-		} chs;
-	} disk_geometry;
-	uint32_t	disk_type;
-	uint32_t	checksum;
-	uuid_t		unique_id;
-	uint8_t		saved_state;
-	uint8_t		reserved[427];
-} vhd_footer;
-#pragma pack(pop)
-
 // WIM API Prototypes
-#define WIM_GENERIC_READ            GENERIC_READ
-#define WIM_OPEN_EXISTING           OPEN_EXISTING
-#define WIM_UNDOCUMENTED_BULLSHIT   0x20000000
 PF_TYPE_DECL(WINAPI, HANDLE, WIMCreateFile, (PWSTR, DWORD, DWORD, DWORD, DWORD, PDWORD));
 PF_TYPE_DECL(WINAPI, BOOL, WIMSetTemporaryPath, (HANDLE, PWSTR));
 PF_TYPE_DECL(WINAPI, HANDLE, WIMLoadImage, (HANDLE, DWORD));
@@ -149,6 +47,13 @@ PF_TYPE_DECL(WINAPI, DWORD, WIMRegisterMessageCallback, (HANDLE, FARPROC, PVOID)
 PF_TYPE_DECL(WINAPI, DWORD, WIMUnregisterMessageCallback, (HANDLE, FARPROC));
 PF_TYPE_DECL(RPC_ENTRY, RPC_STATUS, UuidCreate, (UUID __RPC_FAR*));
 
+typedef struct {
+	int index;
+	BOOL commit;
+	const char* image;
+	const char* dst;
+} mount_params_t;
+
 uint32_t wim_nb_files, wim_proc_files, wim_extra_files;
 HANDLE wim_thread = NULL;
 extern int default_thread_priority;
@@ -161,14 +66,12 @@ static wchar_t wmount_path[MAX_PATH] = { 0 }, wmount_track[MAX_PATH] = { 0 };
 static char sevenzip_path[MAX_PATH];
 static const char conectix_str[] = VHD_FOOTER_COOKIE;
 static BOOL count_files;
-// Apply/Mount image functionality
-static const char *_image, *_dst;
-static int _index, progress_op = OP_FILE_COPY, progress_msg = MSG_267;
+static int progress_op = OP_FILE_COPY, progress_msg = MSG_267;
 
 static BOOL Get7ZipPath(void)
 {
-	if ( (GetRegistryKeyStr(REGKEY_HKCU, "7-Zip\\Path", sevenzip_path, sizeof(sevenzip_path)))
-	  || (GetRegistryKeyStr(REGKEY_HKLM, "7-Zip\\Path", sevenzip_path, sizeof(sevenzip_path))) ) {
+	if ( (GetRegistryKeyStr(REGKEY_HKCU, "Software\\7-Zip\\Path", sevenzip_path, sizeof(sevenzip_path)))
+	  || (GetRegistryKeyStr(REGKEY_HKLM, "Software\\7-Zip\\Path", sevenzip_path, sizeof(sevenzip_path))) ) {
 		static_strcat(sevenzip_path, "\\7z.exe");
 		return (_accessU(sevenzip_path, 0) != -1);
 	}
@@ -287,8 +190,7 @@ static comp_assoc file_assoc[] = {
 };
 
 // For now we consider that an image that matches a known extension is bootable
-#define MBR_SIZE 512	// Might need to review this once we see bootable 4k systems
-BOOL IsCompressedBootableImage(const char* path)
+static BOOL IsCompressedBootableImage(const char* path)
 {
 	char *p;
 	unsigned char *buf = NULL;
@@ -309,7 +211,7 @@ BOOL IsCompressedBootableImage(const char* path)
 			if (buf == NULL)
 				return FALSE;
 			FormatStatus = 0;
-			bled_init(_uprintf, NULL, NULL, NULL, NULL, &FormatStatus);
+			bled_init(uprintf, NULL, NULL, NULL, NULL, &FormatStatus);
 			dc = bled_uncompress_to_buffer(path, (char*)buf, MBR_SIZE, file_assoc[i].type);
 			bled_exit();
 			if (dc != MBR_SIZE) {
@@ -466,7 +368,7 @@ DWORD WINAPI WimProgressCallback(DWORD dwMsgId, WPARAM wParam, LPARAM lParam, PV
 	case WIM_MSG_ERROR:
 		if (level == NULL) level = "error";
 		SetLastError((DWORD)lParam);
-		uprintf("WIM processing %s: %S [err = %d]\n", level, (PWSTR)wParam, WindowsErrorString());
+		uprintf("WIM processing %s: %S [%s]\n", level, (PWSTR)wParam, WindowsErrorString());
 		break;
 	}
 
@@ -517,15 +419,20 @@ static DWORD WINAPI WimMountImageThread(LPVOID param)
 {
 	BOOL r = FALSE;
 	wconvert(temp_dir);
-	wchar_t* wimage = utf8_to_wchar(_image);
+	mount_params_t* mp = (mount_params_t*)param;
+	wchar_t* wimage = utf8_to_wchar(mp->image);
 
 	PF_INIT_OR_OUT(WIMRegisterMessageCallback, Wimgapi);
 	PF_INIT_OR_OUT(WIMMountImage, Wimgapi);
+	PF_INIT_OR_OUT(WIMUnmountImage, Wimgapi);
 	PF_INIT_OR_OUT(WIMUnregisterMessageCallback, Wimgapi);
 
 	if (wmount_path[0] != 0) {
-		uprintf("WimMountImage: An image is already mounted");
-		goto out;
+		uprintf("WimMountImage: An image is already mounted. Trying to unmount it...");
+		if (pfWIMUnmountImage(wmount_path, wimage, mp->index, FALSE))
+			uprintf("WimMountImage: Successfully unmounted existing image..");
+		else
+			goto out;
 	}
 	if (GetTempFileNameW(wtemp_dir, L"Ruf", 0, wmount_path) == 0) {
 		uprintf("WimMountImage: Can not generate mount directory: %s", WindowsErrorString());
@@ -548,7 +455,7 @@ static DWORD WINAPI WimMountImageThread(LPVOID param)
 
 	progress_report_mask = WIM_REPORT_PROGRESS;
 	progress_op = OP_PATCH;
-	progress_msg = MSG_324;
+	progress_msg = MSG_325;
 	progress_offset = 1;
 	progress_total = PATCH_PROGRESS_TOTAL;
 	if (pfWIMRegisterMessageCallback(NULL, (FARPROC)WimProgressCallback, NULL) == INVALID_CALLBACK_VALUE) {
@@ -556,15 +463,25 @@ static DWORD WINAPI WimMountImageThread(LPVOID param)
 		goto out;
 	}
 
-	r = pfWIMMountImage(wmount_path, wimage, _index, wmount_track);
+	r = pfWIMMountImage(wmount_path, wimage, mp->index, wmount_track);
 	pfWIMUnregisterMessageCallback(NULL, (FARPROC)WimProgressCallback);
 	if (!r) {
-		uprintf("Could not mount '%S [%d]' on '%S': %s", wimage, _index, wmount_path, WindowsErrorString());
+		uprintf("Could not mount '%S [%d]' on '%S': %s", wimage, mp->index, wmount_path, WindowsErrorString());
 		goto out;
 	}
-	uprintf("mounted '%S [%d]' on '%S'", wimage, _index, wmount_path);
+	uprintf("Mounted '%S [%d]' on '%S'", wimage, mp->index, wmount_path);
 
 out:
+	if (!r) {
+		if (wmount_track[0] != 0) {
+			RemoveDirectoryW(wmount_track);
+			wmount_track[0] = 0;
+		}
+		if (wmount_path[0] != 0) {
+			RemoveDirectoryW(wmount_path);
+			wmount_path[0] = 0;
+		}
+	}
 	wfree(temp_dir);
 	safe_free(wimage);
 	ExitThread((DWORD)r);
@@ -574,11 +491,23 @@ out:
 // Returned path must be freed by the caller.
 char* WimMountImage(const char* image, int index)
 {
+	char* mount_path = NULL;
 	DWORD dw = 0;
-	_image = image;
-	_index = index;
+	mount_params_t mp = { 0 };
+	mp.image = image;
+	mp.index = index;
 
-	wim_thread = CreateThread(NULL, 0, WimMountImageThread, NULL, 0, NULL);
+	// Try to unmount an existing stale image, if there is any
+	mount_path = GetExistingMountPoint(image, index);
+	if (mount_path != NULL) {
+		uprintf("WARNING: Found stale '%s [%d]' image mounted on '%s' - Attempting to unmount it...",
+			image, index, mount_path);
+		utf8_to_wchar_no_alloc(mount_path, wmount_path, ARRAYSIZE(wmount_path));
+		wmount_track[0] = 0;
+		WimUnmountImage(image, index, FALSE);
+	}
+
+	wim_thread = CreateThread(NULL, 0, WimMountImageThread, &mp, 0, NULL);
 	if (wim_thread == NULL) {
 		uprintf("Unable to start mount-image thread");
 		return NULL;
@@ -594,7 +523,8 @@ char* WimMountImage(const char* image, int index)
 static DWORD WINAPI WimUnmountImageThread(LPVOID param)
 {
 	BOOL r = FALSE;
-	wchar_t* wimage = utf8_to_wchar(_image);
+	mount_params_t* mp = (mount_params_t*)param;
+	wchar_t* wimage = utf8_to_wchar(mp->image);
 
 	PF_INIT_OR_OUT(WIMRegisterMessageCallback, Wimgapi);
 	PF_INIT_OR_OUT(WIMUnmountImage, Wimgapi);
@@ -607,7 +537,7 @@ static DWORD WINAPI WimUnmountImageThread(LPVOID param)
 
 	progress_report_mask = WIM_REPORT_PROGRESS;
 	progress_op = OP_PATCH;
-	progress_msg = MSG_324;
+	progress_msg = MSG_325;
 	progress_offset = 105;
 	progress_total = PATCH_PROGRESS_TOTAL;
 	if (pfWIMRegisterMessageCallback(NULL, (FARPROC)WimProgressCallback, NULL) == INVALID_CALLBACK_VALUE) {
@@ -615,17 +545,17 @@ static DWORD WINAPI WimUnmountImageThread(LPVOID param)
 		goto out;
 	}
 
-	r = pfWIMUnmountImage(wmount_path, wimage, _index, TRUE);
+	r = pfWIMUnmountImage(wmount_path, wimage, mp->index, mp->commit);
 	pfWIMUnregisterMessageCallback(NULL, (FARPROC)WimProgressCallback);
 	if (!r) {
 		uprintf("Could not unmount '%S': %s", wmount_path, WindowsErrorString());
 		goto out;
 	}
-	uprintf("Unmounted '%S [%d]'", wmount_path, _index);
-	if (!RemoveDirectoryW(wmount_track))
+	uprintf("Unmounted '%S [%d]'", wmount_path, mp->index);
+	if (wmount_track[0] != 0 && !RemoveDirectoryW(wmount_track))
 		uprintf("Could not delete '%S' : %s", wmount_track, WindowsErrorString());
 	wmount_track[0] = 0;
-	if (!RemoveDirectoryW(wmount_path))
+	if (wmount_path[0] != 0 && !RemoveDirectoryW(wmount_path))
 		uprintf("Could not delete '%S' : %s", wmount_path, WindowsErrorString());
 	wmount_path[0] = 0;
 out:
@@ -633,13 +563,15 @@ out:
 	ExitThread((DWORD)r);
 }
 
-BOOL WimUnmountImage(const char* image, int index)
+BOOL WimUnmountImage(const char* image, int index, BOOL commit)
 {
 	DWORD dw = 0;
-	_image = image;
-	_index = index;
+	mount_params_t mp = { 0 };
+	mp.image = image;
+	mp.index = index;
+	mp.commit = commit;
 
-	wim_thread = CreateThread(NULL, 0, WimUnmountImageThread, NULL, 0, NULL);
+	wim_thread = CreateThread(NULL, 0, WimUnmountImageThread, &mp, 0, NULL);
 	if (wim_thread == NULL) {
 		uprintf("Unable to start unmount-image thread");
 		return FALSE;
@@ -652,7 +584,59 @@ BOOL WimUnmountImage(const char* image, int index)
 	return dw;
 }
 
-// Extract a file from a WIM image using wimgapi.dll (Windows 7 or later)
+// Get the existing mount point (if any) for the image + index passed as parameters.
+// Needed because Windows refuses to mount two images with the same path/index even
+// if the previous has become stale or deleted. This situation may occur if the user
+// force-closed Rufus when 'boot.wim' was mounted, thus leaving them unable to mount
+// 'boot.wim' for subsequent sessions unless they invoke dism /Unmount-Wim manually.
+// This basically parses HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\WIMMount\Mounted Images
+// to see if an instance exists with the image/index passed as parameter and returns
+// the mount point of this image if found, or NULL otherwise.
+char* GetExistingMountPoint(const char* image, int index)
+{
+	static char path[MAX_PATH];
+	char class[MAX_PATH] = "", guid[40], key_name[MAX_PATH];
+	HKEY hKey;
+	DWORD dw = 0, i, k, nb_subkeys = 0, class_size;
+	DWORD cbMaxSubKey, cchMaxClass, cValues, cchMaxValue;
+	DWORD cbMaxValueData, cbSecurityDescriptor;
+	FILETIME ftLastWriteTime;
+
+	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\WIMMount\\Mounted Images",
+		0, KEY_READ, &hKey) != ERROR_SUCCESS)
+		return NULL;
+
+	class_size = sizeof(class);
+	RegQueryInfoKeyA(hKey, class, &class_size, NULL, &nb_subkeys,
+		&cbMaxSubKey, &cchMaxClass, &cValues, &cchMaxValue,
+		&cbMaxValueData, &cbSecurityDescriptor, &ftLastWriteTime);
+
+	for (k = 0; k < nb_subkeys; k++) {
+		dw = sizeof(guid);
+		if (RegEnumKeyExA(hKey, k, guid, &dw, NULL, NULL, NULL,
+			&ftLastWriteTime) == ERROR_SUCCESS) {
+			static_sprintf(key_name, "SOFTWARE\\Microsoft\\WIMMount\\Mounted Images\\%s\\WIM Path", guid);
+			if (GetRegistryKeyStr(HKEY_LOCAL_MACHINE, key_name, path, sizeof(path)) &&
+				(stricmp(path, image) != 0))
+				continue;
+			static_sprintf(key_name, "SOFTWARE\\Microsoft\\WIMMount\\Mounted Images\\%s\\Image Index", guid);
+			if (GetRegistryKey32(HKEY_LOCAL_MACHINE, key_name, &i) && (i != (DWORD)index))
+				continue;
+			path[0] = 0;
+			static_sprintf(key_name, "SOFTWARE\\Microsoft\\WIMMount\\Mounted Images\\%s\\Mount Path", guid);
+			if (GetRegistryKeyStr(HKEY_LOCAL_MACHINE, key_name, path, sizeof(path)))
+				break;
+		}
+	}
+	if (k >= nb_subkeys)
+		path[0] = 0;
+
+	RegCloseKey(hKey);
+
+	return (path[0] == 0) ? NULL: path;
+}
+
+// Extract a file from a WIM image using wimgapi.dll
 // NB: if you want progress from a WIM callback, you must run the WIM API call in its own thread
 // (which we don't do here) as it won't work otherwise. Thanks go to Erwan for figuring this out!
 BOOL WimExtractFile_API(const char* image, int index, const char* src, const char* dst, BOOL bSilent)
@@ -663,11 +647,11 @@ BOOL WimExtractFile_API(const char* image, int index, const char* src, const cha
 	HANDLE hWim = NULL;
 	HANDLE hImage = NULL;
 	HANDLE hFile = NULL;
-	wchar_t wtemp[MAX_PATH] = {0};
+	wchar_t wtemp[MAX_PATH] = { 0 };
 	wchar_t* wimage = utf8_to_wchar(image);
 	wchar_t* wsrc = utf8_to_wchar(src);
 	wchar_t* wdst = utf8_to_wchar(dst);
-	char* wim_info;
+	wchar_t* wim_info;
 
 	PF_INIT_OR_OUT(WIMCreateFile, Wimgapi);
 	PF_INIT_OR_OUT(WIMSetTemporaryPath, Wimgapi);
@@ -699,7 +683,7 @@ BOOL WimExtractFile_API(const char* image, int index, const char* src, const cha
 
 	suprintf("Extracting: %s (From %s)", dst, src);
 	if (safe_strcmp(src, index_name) == 0) {
-		if (!pfWIMGetImageInformation(hWim, &wim_info, &dw)) {
+		if (!pfWIMGetImageInformation(hWim, &wim_info, &dw) || (dw == 0)) {
 			uprintf("  Could not access WIM info: %s", WindowsErrorString());
 			goto out;
 		}
@@ -809,7 +793,71 @@ BOOL WimExtractFile(const char* image, int index, const char* src, const char* d
 		  || ((wim_flags & WIM_HAS_API_EXTRACT) && WimExtractFile_API(image, index, src, dst, bSilent)) );
 }
 
-// Apply a WIM image using wimgapi.dll (Windows 7 or later)
+/// <summary>
+/// Find if a specific index belongs to a WIM image.
+/// </summary>
+/// <param name="image">The path to the WIM file.</param>
+/// <param name="index">The (non-zero) value of the index to check.</param>
+/// <returns>TRUE if the index was found in the image, FALSE otherwise.</returns>
+BOOL WimIsValidIndex(const char* image, int index)
+{
+	int i = 1;
+	BOOL r = FALSE;
+	DWORD dw = 0;
+	HANDLE hWim = NULL;
+	HANDLE hFile = NULL;
+	char xml_file[MAX_PATH] = { 0 };
+	char* str;
+	wchar_t* wimage = utf8_to_wchar(image);
+	wchar_t* wim_info;
+
+	PF_INIT_OR_OUT(WIMCreateFile, Wimgapi);
+	PF_INIT_OR_OUT(WIMGetImageInformation, Wimgapi);
+	PF_INIT_OR_OUT(WIMCloseHandle, Wimgapi);
+
+	// Zero indexes are invalid
+	if (index == 0)
+		goto out;
+
+	hWim = pfWIMCreateFile(wimage, WIM_GENERIC_READ, WIM_OPEN_EXISTING,
+		(img_report.wininst_version >= SPECIAL_WIM_VERSION) ? WIM_UNDOCUMENTED_BULLSHIT : 0, 0, NULL);
+	if (hWim == NULL) {
+		uprintf("  Could not access image: %s", WindowsErrorString());
+		goto out;
+	}
+
+	if (!pfWIMGetImageInformation(hWim, &wim_info, &dw) || (dw == 0)) {
+		uprintf("  Could not access WIM info: %s", WindowsErrorString());
+		goto out;
+	}
+
+	if ((GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, xml_file) == 0) || (xml_file[0] == 0))
+		static_strcpy(xml_file, ".\\RufVXml.tmp");
+	DeleteFileU(xml_file);
+	hFile = CreateFileU(xml_file, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+		NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if ((hFile == INVALID_HANDLE_VALUE) || (!WriteFile(hFile, wim_info, dw, &dw, NULL)))
+		goto out;
+
+	while ((str = get_token_data_file_indexed("IMAGE INDEX", xml_file, i)) != NULL) {
+		if (atoi(str) == index) {
+			r = TRUE;
+			break;
+		}
+		i++;
+	}
+
+out:
+	if (hWim != NULL)
+		pfWIMCloseHandle(hWim);
+	safe_closehandle(hFile);
+	if (xml_file[0] != 0)
+		DeleteFileU(xml_file);
+	safe_free(wimage);
+	return r;
+}
+
+// Apply a WIM image using wimgapi.dll
 // https://docs.microsoft.com/en-us/previous-versions/msdn10/dd851944(v=msdn.10)
 // To get progress, we must run this call within its own thread
 static DWORD WINAPI WimApplyImageThread(LPVOID param)
@@ -817,9 +865,10 @@ static DWORD WINAPI WimApplyImageThread(LPVOID param)
 	BOOL r = FALSE;
 	HANDLE hWim = NULL;
 	HANDLE hImage = NULL;
-	wchar_t wtemp[MAX_PATH] = {0};
-	wchar_t* wimage = utf8_to_wchar(_image);
-	wchar_t* wdst = utf8_to_wchar(_dst);
+	wchar_t wtemp[MAX_PATH] = { 0 };
+	mount_params_t* mp = (mount_params_t*)param;
+	wchar_t* wimage = utf8_to_wchar(mp->image);
+	wchar_t* wdst = utf8_to_wchar(mp->dst);
 
 	PF_INIT_OR_OUT(WIMRegisterMessageCallback, Wimgapi);
 	PF_INIT_OR_OUT(WIMCreateFile, Wimgapi);
@@ -829,7 +878,7 @@ static DWORD WINAPI WimApplyImageThread(LPVOID param)
 	PF_INIT_OR_OUT(WIMCloseHandle, Wimgapi);
 	PF_INIT_OR_OUT(WIMUnregisterMessageCallback, Wimgapi);
 
-	uprintf("Opening: %s:[%d]", _image, _index);
+	uprintf("Opening: %s:[%d]", mp->image, mp->index);
 
 	progress_report_mask = WIM_REPORT_PROCESS | WIM_REPORT_FILEINFO;
 	progress_op = OP_FILE_COPY;
@@ -858,7 +907,7 @@ static DWORD WINAPI WimApplyImageThread(LPVOID param)
 		goto out;
 	}
 
-	hImage = pfWIMLoadImage(hWim, (DWORD)_index);
+	hImage = pfWIMLoadImage(hWim, (DWORD)mp->index);
 	if (hImage == NULL) {
 		uprintf("  Could not set index: %s", WindowsErrorString());
 		goto out;
@@ -897,7 +946,7 @@ static DWORD WINAPI WimApplyImageThread(LPVOID param)
 
 out:
 	if ((hImage != NULL) || (hWim != NULL)) {
-		uprintf("Closing: %s", _image);
+		uprintf("Closing: %s", mp->image);
 		if (hImage != NULL) pfWIMCloseHandle(hImage);
 		if (hWim != NULL) pfWIMCloseHandle(hWim);
 	}
@@ -911,11 +960,12 @@ out:
 BOOL WimApplyImage(const char* image, int index, const char* dst)
 {
 	DWORD dw = 0;
-	_image = image;
-	_index = index;
-	_dst = dst;
+	mount_params_t mp = { 0 };
+	mp.image = image;
+	mp.index = index;
+	mp.dst = dst;
 
-	wim_thread = CreateThread(NULL, 0, WimApplyImageThread, NULL, 0, NULL);
+	wim_thread = CreateThread(NULL, 0, WimApplyImageThread, &mp, 0, NULL);
 	if (wim_thread == NULL) {
 		uprintf("Unable to start apply-image thread");
 		return FALSE;

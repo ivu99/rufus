@@ -312,6 +312,7 @@ IF_DESKTOP(long long) int FAST_FUNC unpack_zip_stream(transformer_state_t *xstat
 			xstate->dst_size = zip_header.formatted.ucmpsize;
 			xstate->dst_name = xzalloc(zip_header.formatted.filename_len + 1);
 			safe_read(xstate->src_fd, xstate->dst_name, zip_header.formatted.filename_len);
+			xstate->dst_name[zip_header.formatted.filename_len] = 0;
 			n = transformer_switch_file(xstate);
 			free(xstate->dst_name);
 			if (n < 0)
@@ -333,7 +334,7 @@ IF_DESKTOP(long long) int FAST_FUNC unpack_zip_stream(transformer_state_t *xstat
 
 			/* Validate decompression */
 			if (n >= 0) {
-				if (zip_header.formatted.ucmpsize != xstate->bytes_out)
+				if (zip_header.formatted.ucmpsize != 0xffffffffL && zip_header.formatted.ucmpsize != xstate->bytes_out)
 					bb_error_msg_and_err("bad length");
 				else if (zip_header.formatted.crc32 != (xstate->crc32 ^ 0xffffffffL))
 					bb_error_msg_and_err("crc error");

@@ -406,14 +406,14 @@ BOOL FormatExtFs(DWORD DriveIndex, uint64_t PartitionOffset, DWORD BlockSize, LP
 	// Create root and lost+found dirs
 	r = ext2fs_mkdir(ext2fs, EXT2_ROOT_INO, EXT2_ROOT_INO, 0);
 	if (r != 0) {
-		SET_EXT2_FORMAT_ERROR(ERROR_DIR_NOT_ROOT);
+		SET_EXT2_FORMAT_ERROR(ERROR_FILE_CORRUPT);
 		uprintf("Failed to create %s root dir: %s", FSName, error_message(r));
 		goto out;
 	}
 	ext2fs->umask = 077;
 	r = ext2fs_mkdir(ext2fs, EXT2_ROOT_INO, 0, "lost+found");
 	if (r != 0) {
-		SET_EXT2_FORMAT_ERROR(ERROR_DIR_NOT_ROOT);
+		SET_EXT2_FORMAT_ERROR(ERROR_FILE_CORRUPT);
 		uprintf("Failed to create %s 'lost+found' dir: %s", FSName, error_message(r));
 		goto out;
 	}
@@ -461,13 +461,19 @@ BOOL FormatExtFs(DWORD DriveIndex, uint64_t PartitionOffset, DWORD BlockSize, LP
 		int written = 0, fsize = sizeof(data) - 1;
 		ext2_file_t ext2fd;
 		ext2_ino_t inode_id;
-		uint32_t ctime = (uint32_t)time(0);
+		time_t ctime = time(NULL);
 		struct ext2_inode inode = { 0 };
+		// Don't care about the Y2K38 problem of ext2/ext3 for a 'persistence.conf' timestamp
+		if (ctime > UINT32_MAX)
+			ctime = UINT32_MAX;
 		inode.i_mode = 0100644;
 		inode.i_links_count = 1;
-		inode.i_atime = ctime;
-		inode.i_ctime = ctime;
-		inode.i_mtime = ctime;
+		// coverity[store_truncates_time_t]
+		inode.i_atime = (uint32_t)ctime;
+		// coverity[store_truncates_time_t]
+		inode.i_ctime = (uint32_t)ctime;
+		// coverity[store_truncates_time_t]
+		inode.i_mtime = (uint32_t)ctime;
 		inode.i_size = fsize;
 
 		ext2fs_namei(ext2fs, EXT2_ROOT_INO, EXT2_ROOT_INO, name, &inode_id);
@@ -491,7 +497,6 @@ BOOL FormatExtFs(DWORD DriveIndex, uint64_t PartitionOffset, DWORD BlockSize, LP
 		goto out;
 	}
 	UpdateProgressWithInfo(OP_FORMAT, MSG_217, 100, 100);
-	uprintf("Done");
 	ret = TRUE;
 
 out:

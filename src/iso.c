@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * ISO file extraction
- * Copyright © 2011-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2023 Pete Batard <pete@akeo.ie>
  * Based on libcdio's iso & udf samples:
  * Copyright © 2003-2014 Rocky Bernstein <rocky@gnu.org>
  *
@@ -92,17 +92,17 @@ static const char* ldlinux_name = "ldlinux.sys";
 static const char* ldlinux_c32 = "ldlinux.c32";
 static const char* md5sum_name[] = { "MD5SUMS", "md5sum.txt" };
 static const char* casper_dirname = "/casper";
+static const char* proxmox_dirname = "/proxmox";
 static const char* efi_dirname = "/efi/boot";
-static const char* efi_bootname[MAX_ARCHS] = {
-	"bootia32.efi", "bootia64.efi", "bootx64.efi", "bootarm.efi", "bootaa64.efi",
-	"bootebc.efi", "bootriscv32.efi", "bootriscv64.efi", "bootriscv128.efi" };
+static const char* efi_bootname[ARCH_MAX] = {
+	"boot.efi", "bootia32.efi", "bootx64.efi", "bootarm.efi", "bootaa64.efi", "bootia64.efi",
+	"bootriscv32.efi", "bootriscv64.efi", "bootriscv128.efi", "bootebc.efi" };
 static const char* sources_str = "/sources";
 static const char* wininst_name[] = { "install.wim", "install.esd", "install.swm" };
 // We only support GRUB/BIOS (x86) that uses a standard config dir (/boot/grub/i386-pc/)
 // If the disc was mastered properly, GRUB/EFI will take care of itself
-static const char* grub_dirname = "/boot/grub/i386-pc";
+static const char* grub_dirname[] = { "/boot/grub/i386-pc", "/boot/grub2/i386-pc" };
 static const char* grub_cfg[] = { "grub.cfg", "loopback.cfg" };
-static const char* compatresources_dll = "compatresources.dll";
 static const char* menu_cfg = "menu.cfg";
 // NB: Do not alter the order of the array below without validating hardcoded indexes in check_iso_props
 static const char* syslinux_cfg[] = { "isolinux.cfg", "syslinux.cfg", "extlinux.conf", "txt.cfg" };
@@ -115,7 +115,7 @@ static const char* autorun_name = "autorun.inf";
 static const char* manjaro_marker = ".miso";
 static const char* pop_os_name = "pop-os";
 static const char* stupid_antivirus = "  NOTE: This is usually caused by a poorly designed security solution. "
-	"See https://goo.gl/QTobxX.\r\n  This file will be skipped for now, but you should really "
+	"See https://bit.ly/40qDtyF.\r\n  This file will be skipped for now, but you should really "
 	"look into using a *SMARTER* antivirus solution.";
 const char* old_c32_name[NB_OLD_C32] = OLD_C32_NAMES;
 static const int64_t old_c32_threshold[NB_OLD_C32] = OLD_C32_THRESHOLD;
@@ -123,6 +123,7 @@ static uint8_t joliet_level = 0;
 static uint64_t total_blocks, nb_blocks;
 static BOOL scan_only = FALSE;
 static StrArray config_path, isolinux_path, modified_path;
+static char symlinked_syslinux[MAX_PATH];
 
 // Ensure filenames do not contain invalid FAT32 or NTFS characters
 static __inline char* sanitize_filename(char* filename, BOOL* is_identical)
@@ -211,8 +212,10 @@ static BOOL check_iso_props(const char* psz_dirname, int64_t file_length, const 
 		}
 	} else {	// Scan-time checks
 		// Check for GRUB artifacts
-		if (safe_stricmp(psz_dirname, grub_dirname) == 0)
-			img_report.has_grub2 = TRUE;
+		for (i = 0; i < ARRAYSIZE(grub_dirname); i++) {
+			if (safe_stricmp(psz_dirname, grub_dirname[i]) == 0)
+				img_report.has_grub2 = (uint8_t)i + 1;
+		}
 
 		// Check for a syslinux v5.0+ file anywhere
 		if (safe_stricmp(psz_basename, ldlinux_c32) == 0) {
@@ -226,7 +229,12 @@ static BOOL check_iso_props(const char* psz_dirname, int64_t file_length, const 
 				img_report.disable_iso = TRUE;
 		}
 
-		// Check for various files in root (psz_dirname = "")
+		// Check for a '/proxmox' directory
+		if (safe_stricmp(psz_dirname, proxmox_dirname) == 0) {
+			img_report.disable_iso = TRUE;
+		}
+
+		// Check for various files and directories in root (psz_dirname = "")
 		if ((psz_dirname != NULL) && (psz_dirname[0] == 0)) {
 			if (safe_stricmp(psz_basename, bootmgr_name) == 0) {
 				img_report.has_bootmgr = TRUE;
@@ -280,9 +288,6 @@ static BOOL check_iso_props(const char* psz_dirname, int64_t file_length, const 
 						}
 					}
 				}
-				// Check for "compatresources.dll" in "###/sources/"
-				if (safe_stricmp(psz_basename, compatresources_dll) == 0)
-					img_report.has_compatresources_dll = TRUE;
 			}
 		}
 
@@ -317,16 +322,15 @@ static BOOL check_iso_props(const char* psz_dirname, int64_t file_length, const 
 // Apply various workarounds to Linux config files
 static void fix_config(const char* psz_fullpath, const char* psz_path, const char* psz_basename, EXTRACT_PROPS* props)
 {
-	BOOL modified = FALSE;
-	size_t i, nul_pos;
+	BOOL modified = FALSE, patched;
+	size_t nul_pos;
 	char *iso_label = NULL, *usb_label = NULL, *src, *dst;
 
-	nul_pos = safe_strlen(psz_fullpath);
 	src = safe_strdup(psz_fullpath);
 	if (src == NULL)
 		return;
-	for (i=0; i<nul_pos; i++)
-		if (src[i] == '/') src[i] = '\\';
+	nul_pos = strlen(src);
+	to_windows_path(src);
 
 	// Add persistence to the kernel options
 	if ((boot_type == BT_IMAGE) && HAS_PERSISTENCE(img_report) && persistence_size) {
@@ -334,6 +338,7 @@ static void fix_config(const char* psz_fullpath, const char* psz_path, const cha
 			if (replace_in_token_data(src, props->is_grub_cfg ? "linux" : "append",
 				"file=/cdrom/preseed", "persistent file=/cdrom/preseed", TRUE) != NULL) {
 				// Ubuntu & derivatives are assumed to use 'file=/cdrom/preseed/...'
+				// or 'layerfs-path=minimal.standard.live.squashfs' (see below)
 				// somewhere in their kernel options and use 'persistent' as keyword.
 				uprintf("  Added 'persistent' kernel option");
 				modified = TRUE;
@@ -341,6 +346,11 @@ static void fix_config(const char* psz_fullpath, const char* psz_path, const cha
 				if ((props->is_grub_cfg) && replace_in_token_data(src, "linux",
 					"maybe-ubiquity", "", TRUE))
 					uprintf("  Removed 'maybe-ubiquity' kernel option");
+			} else if (replace_in_token_data(src, "linux", "layerfs-path=minimal.standard.live.squashfs",
+				"persistent layerfs-path=minimal.standard.live.squashfs", TRUE) != NULL) {
+				// Ubuntu 23.04 uses GRUB only with the above and does not use "maybe-ubiquity"
+				uprintf("  Added 'persistent' kernel option");
+				modified = TRUE;
 			} else if (replace_in_token_data(src, props->is_grub_cfg ? "linux" : "append",
 				"boot=live", "boot=live persistence", TRUE) != NULL) {
 				// Debian & derivatives are assumed to use 'boot=live' in
@@ -359,34 +369,44 @@ static void fix_config(const char* psz_fullpath, const char* psz_path, const cha
 	// Workaround for config files requiring an ISO label for kernel append that may be
 	// different from our USB label. Oh, and these labels must have spaces converted to \x20.
 	if ((props->is_cfg) || (props->is_conf)) {
+		// Older versions of GRUB EFI used "linuxefi", newer just use "linux".
+		// Also, in their great wisdom, the openSUSE maintainers added a 'set linux=linux'
+		// line to their grub.cfg, which means that their kernel option cfg_token is no longer
+		//'linux' but '$linux'... and we have to add a workaround for that.
+		// Then, newer Arch and derivatives added an extra "search --label ..." command
+		// in their GRUB conf, which we need to cater for in supplement of the kernel line.
+		// Finally, we're just shoving the known isolinux/syslinux tokens in there to process
+		// all config files equally.
+		static const char* cfg_token[] = { "options", "append", "linux", "linuxefi", "$linux", "search" };
 		iso_label = replace_char(img_report.label, ' ', "\\x20");
 		usb_label = replace_char(img_report.usb_label, ' ', "\\x20");
 		if ((iso_label != NULL) && (usb_label != NULL)) {
-			if (props->is_grub_cfg) {
-				// Older versions of GRUB EFI used "linuxefi", newer just use "linux"
-				if ((replace_in_token_data(src, "linux", iso_label, usb_label, TRUE) != NULL) ||
-					(replace_in_token_data(src, "linuxefi", iso_label, usb_label, TRUE) != NULL) ||
-					// In their great wisdom, the openSUSE maintainers added a 'set linux=linux'
-					// line to their grub.cfg, which means that their kernel option token is no
-					// longer 'linux' but '$linux'... and we have to add a workaround for that.
-					(replace_in_token_data(src, "$linux", iso_label, usb_label, TRUE) != NULL)) {
-					uprintf("  Patched %s: '%s' ➔ '%s'\n", src, iso_label, usb_label);
+			patched = FALSE;
+			for (int i = 0; i < ARRAYSIZE(cfg_token); i++) {
+				if (replace_in_token_data(src, cfg_token[i], iso_label, usb_label, TRUE) != NULL) {
 					modified = TRUE;
+					patched = TRUE;
 				}
-			} else if (replace_in_token_data(src, (props->is_conf) ? "options" : "append",
-				iso_label, usb_label, TRUE) != NULL) {
-				uprintf("  Patched %s: '%s' ➔ '%s'\n", src, iso_label, usb_label);
-				modified = TRUE;
 			}
-			//
+			if (patched)
+				uprintf("  Patched %s: '%s' ➔ '%s'\n", src, iso_label, usb_label);
 			// Since version 8.2, and https://github.com/rhinstaller/anaconda/commit/a7661019546ec1d8b0935f9cb0f151015f2e1d95,
 			// Red Hat derivatives have changed their CD-ROM detection policy which leads to the installation source
 			// not being found. So we need to use 'inst.repo' instead of 'inst.stage2' in the kernel options.
-			//
-			if (img_report.rh8_derivative && (replace_in_token_data(src, props->is_grub_cfg ?
-				"linuxefi" : "append", "inst.stage2", "inst.repo", TRUE) != NULL)) {
-				uprintf("  Patched %s: '%s' ➔ '%s'\n", src, "inst.stage2", "inst.repo");
-				modified = TRUE;
+			// *EXCEPT* this should not be done for netinst media such as Fedora 37 netinstall and trying to differentiate
+			// netinst from regular is a pain. So, because I don't have all day to fix the mess that Red-Hat created when
+			// they introduced a kernel option to decide where the source packages should be picked from we're just going
+			// to *hope* that users didn't rename their ISOs and check whether it contains 'netinst' or not. Oh well...
+			patched = FALSE;
+			if (img_report.rh8_derivative && (strstr(image_path, "netinst") == NULL)) {
+				for (int i = 0; i < ARRAYSIZE(cfg_token); i++) {
+					if (replace_in_token_data(src, cfg_token[i], "inst.stage2", "inst.repo", TRUE) != NULL) {
+						modified = TRUE;
+						patched = TRUE;
+					}
+				}
+				if (patched)
+					uprintf("  Patched %s: '%s' ➔ '%s'\n", src, "inst.stage2", "inst.repo");
 			}
 		}
 		safe_free(iso_label);
@@ -427,25 +447,21 @@ static void fix_config(const char* psz_fullpath, const char* psz_path, const cha
 
 static void print_extracted_file(char* psz_fullpath, uint64_t file_length)
 {
-	size_t i, nul_pos;
+	size_t nul_pos;
 
 	if (psz_fullpath == NULL)
 		return;
 	// Replace slashes with backslashes and append the size to the path for UI display
+	to_windows_path(psz_fullpath);
 	nul_pos = strlen(psz_fullpath);
-	for (i = 0; i < nul_pos; i++)
-		if (psz_fullpath[i] == '/')
-			psz_fullpath[i] = '\\';
 	safe_sprintf(&psz_fullpath[nul_pos], 24, " (%s)", SizeToHumanReadable(file_length, TRUE, FALSE));
 	uprintf("Extracting: %s\n", psz_fullpath);
 	safe_sprintf(&psz_fullpath[nul_pos], 24, " (%s)", SizeToHumanReadable(file_length, FALSE, FALSE));
 	PrintStatus(0, MSG_000, psz_fullpath);	// MSG_000 is "%s"
-	// ISO9660 cannot handle backslashes
-	for (i = 0; i < nul_pos; i++)
-		if (psz_fullpath[i] == '\\')
-			psz_fullpath[i] = '/';
 	// Remove the appended size for extraction
 	psz_fullpath[nul_pos] = 0;
+	// ISO9660 cannot handle backslashes
+	to_unix_path(psz_fullpath);
 }
 
 static void alt_print_extracted_file(const char* psz_fullpath, uint64_t file_length)
@@ -460,7 +476,7 @@ static LPFILETIME __inline to_filetime(time_t t)
 {
 	static int i = 0;
 	static FILETIME ft[3], *r;
-	LONGLONG ll = Int32x32To64(t, 10000000) + 116444736000000000;
+	LONGLONG ll = (t * 10000000LL) + 116444736000000000LL;
 
 	r = &ft[i];
 	r->dwLowDateTime = (DWORD)ll;
@@ -602,8 +618,7 @@ static int udf_extract_files(udf_t *p_udf, udf_dirent_t *p_udf_dirent, const cha
 	return 0;
 
 out:
-	if (p_udf_dirent != NULL)
-		udf_dirent_free(p_udf_dirent);
+	udf_dirent_free(p_udf_dirent);
 	ISO_BLOCKING(safe_closehandle(file_handle));
 	safe_free(psz_sanpath);
 	safe_free(psz_fullpath);
@@ -672,7 +687,7 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 	HANDLE file_handle = NULL;
 	DWORD buf_size, wr_size, err;
 	EXTRACT_PROPS props;
-	BOOL is_symlink, is_identical;
+	BOOL is_symlink, is_identical, free_p_statbuf = FALSE;
 	int length, r = 1;
 	char tmp[128], psz_fullpath[MAX_PATH], *psz_basename = NULL, *psz_sanpath = NULL;
 	const char *psz_iso_name = &psz_fullpath[strlen(psz_extract_dir)];
@@ -703,6 +718,7 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 	_CDIO_LIST_FOREACH(p_entnode, p_entlist) {
 		if (FormatStatus) goto out;
 		p_statbuf = (iso9660_stat_t*) _cdio_list_node_data(p_entnode);
+		free_p_statbuf = FALSE;
 		if (scan_only && (p_statbuf->rr.b3_rock == yep) && enable_rockridge) {
 			if (p_statbuf->rr.u_su_fields & ISO_ROCK_SUF_PL) {
 				if (!img_report.has_deep_directories)
@@ -733,13 +749,9 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 			safe_strcpy(psz_basename, sizeof(psz_fullpath) - length - 1, p_statbuf->filename);
 			if (safe_strlen(p_statbuf->filename) > 64)
 				img_report.has_long_filename = TRUE;
-			// libcdio has a memleak for Rock Ridge symlinks. It doesn't look like there's an easy fix there as
-			// a generic list that's unaware of RR extensions is being used, so we prevent that memleak ourselves
 			is_symlink = (p_statbuf->rr.psz_symlink != NULL);
 			if (is_symlink)
 				img_report.has_symlinks = SYMLINKS_RR;
-			if (scan_only)
-				safe_free(p_statbuf->rr.psz_symlink);
 		} else {
 			iso9660_name_translate_ext(p_statbuf->filename, psz_basename, joliet_level);
 		}
@@ -763,7 +775,8 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 			if (check_iso_props(psz_path, file_length, psz_basename, psz_fullpath, &props)) {
 				continue;
 			}
-			print_extracted_file(psz_fullpath, file_length);
+			if (!is_symlink)
+				print_extracted_file(psz_fullpath, file_length);
 			for (i = 0; i < NB_OLD_C32; i++) {
 				if (props.is_old_c32[i] && use_own_c32[i]) {
 					static_sprintf(tmp, "%s/syslinux-%s/%s", FILES_DIR, embedded_sl_version_str[0], old_c32_name[i]);
@@ -780,9 +793,36 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 			if (!is_identical)
 				uprintf("  File name sanitized to '%s'", psz_sanpath);
 			if (is_symlink) {
-				if (file_length == 0)
-					uprintf("  Ignoring Rock Ridge symbolic link to '%s'", p_statbuf->rr.psz_symlink);
-				safe_free(p_statbuf->rr.psz_symlink);
+				if (file_length == 0) {
+					if ((safe_stricmp(p_statbuf->filename, "syslinux") == 0) &&
+						// Special handling for ISOs that have a syslinux → isolinux symbolic link (e.g. Knoppix)
+						(safe_stricmp(p_statbuf->rr.psz_symlink, "isolinux") == 0)) {
+						static_strcpy(symlinked_syslinux, psz_fullpath);
+						print_extracted_file(psz_fullpath, file_length);
+						uprintf("  Found Rock Ridge symbolic link to '%s'", p_statbuf->rr.psz_symlink);
+					} else if (strcmp(psz_path, "/firmware") == 0) {
+						// Special handling for ISOs that use symlinks for /firmware/ (e.g. Debian non-free)
+						// TODO: Do we want to do this for all file symlinks?
+						char target_path[256];
+						static_sprintf(target_path, "%s/%s", psz_path, p_statbuf->rr.psz_symlink);
+						p_statbuf = iso9660_ifs_stat_translate(p_iso, target_path);
+						if (p_statbuf != NULL) {
+							// The original p_statbuf will be freed automatically, but not
+							// the new one so we need to force an explicit free.
+							free_p_statbuf = TRUE;
+							file_length = p_statbuf->total_size;
+							print_extracted_file(psz_fullpath, file_length);
+							uprintf("  Duplicated from '%s'", target_path);
+						} else {
+							uprintf("Could not resolve Rock Ridge Symlink - ABORTING!");
+							goto out;
+						}
+					} else {
+						// TODO: Ideally, we'd want to create a text file that contains the target link
+						print_extracted_file(psz_fullpath, file_length);
+						uprintf("  Ignoring Rock Ridge symbolic link to '%s'", p_statbuf->rr.psz_symlink);
+					}
+				}
 			}
 			file_handle = CreatePreallocatedFile(psz_sanpath, GENERIC_READ | GENERIC_WRITE,
 				FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, file_length);
@@ -818,6 +858,8 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 				if (!SetFileTime(file_handle, ft, ft, ft))
 					uprintf("  Could not set timestamp: %s", WindowsErrorString());
 			}
+			if (free_p_statbuf)
+				iso9660_stat_free(p_statbuf);
 			ISO_BLOCKING(safe_closehandle(file_handle));
 			if (props.is_cfg || props.is_conf)
 				fix_config(psz_sanpath, psz_path, psz_basename, &props);
@@ -835,19 +877,34 @@ out:
 
 void GetGrubVersion(char* buf, size_t buf_size)
 {
+	// In typical "I'll make my own Open Source... with blackjack and hookers!" fashion,
+	// IBM/Red-Hat/Fedora took it upon themselves to "fix" the double space typo from the
+	// GRUB version string. But of course, just like their introduction of GRUB calls like
+	// 'grub_debug_is_enabled', they didn't want to bother upstreaming their changes...
+	// On the other hand, boy do they want to leech of FSF/GNU developed software, while
+	// not having it mention GNU anywhere. See:
+	// https://src.fedoraproject.org/rpms/grub2/blob/rawhide/f/0024-Don-t-say-GNU-Linux-in-generated-menus.patch
+	const char* grub_version_str[] = { "GRUB  version %s", "GRUB version %s" };
+	const char* grub_debug_is_enabled_str = "grub_debug_is_enabled";
+	const size_t max_string_size = 32;	// The strings above *MUST* be no longer than this value
 	char *p, unauthorized[] = {'<', '>', ':', '|', '*', '?', '\\', '/'};
-	size_t i;
-	const char grub_version_str[] = "GRUB  version %s";
+	size_t i, j;
+	BOOL has_grub_debug_is_enabled = FALSE;
 
-	for (i=0; i<buf_size; i++) {
-		if (memcmp(&buf[i], grub_version_str, sizeof(grub_version_str)) == 0) {
-			static_strcpy(img_report.grub2_version, &buf[i + sizeof(grub_version_str)]);
-			break;
+	// Make sure we don't overflow our buffer
+	if (buf_size > max_string_size) {
+		for (i = 0; i < buf_size - max_string_size; i++) {
+			for (j = 0; j < ARRAYSIZE(grub_version_str); j++) {
+				if (memcmp(&buf[i], grub_version_str[j], strlen(grub_version_str[j]) + 1) == 0)
+					static_strcpy(img_report.grub2_version, &buf[i + strlen(grub_version_str[j]) + 1]);
+			}
+			if (memcmp(&buf[i], grub_debug_is_enabled_str, strlen(grub_debug_is_enabled_str)) == 0)
+				has_grub_debug_is_enabled = TRUE;
 		}
 	}
 	// Sanitize the string
 	for (p = &img_report.grub2_version[0]; *p; p++) {
-		for (i=0; i<sizeof(unauthorized); i++) {
+		for (i = 0; i < sizeof(unauthorized); i++) {
 			if (*p == unauthorized[i])
 				*p = '_';
 		}
@@ -856,13 +913,36 @@ void GetGrubVersion(char* buf, size_t buf_size)
 	// But seriously, these guys should know better than "security" through obscurity...
 	if (img_report.grub2_version[0] == '0')
 		img_report.grub2_version[0] = 0;
-}
 
-// Linking to version.lib would result in DLL sideloading issues, so we don't
-// See https://github.com/pbatard/rufus/pull/1838
-PF_TYPE_DECL(WINAPI, DWORD, GetFileVersionInfoSizeW, (LPCWSTR, LPDWORD));
-PF_TYPE_DECL(WINAPI, BOOL, GetFileVersionInfoW, (LPCWSTR, DWORD, DWORD, LPVOID));
-PF_TYPE_DECL(WINAPI, BOOL, VerQueryValueA, (LPCVOID, LPCSTR, LPVOID, PUINT));
+	// For some obscure reason, openSUSE have decided that their Live images should
+	// use /boot/grub2/ as their prefix directory instead of the standard /boot/grub/
+	// This creates a MAJOR issue because the prefix directory is hardcoded in
+	// 'core.img', and Rufus must install a 'core.img', that is not provided by the
+	// ISO, for the USB to boot (since even trying to pick the one from ISOHybrid
+	// does usually not guarantees the presence of the FAT driver which is mandatory
+	// for ISO boot).
+	// Therefore, when *someone* uses a nonstandard GRUB prefix directory, our base
+	// 'core.img' can't work with their image, since it isn't able to load modules
+	// like 'normal.mod', that are required to access the configuration files. Oh and
+	// you can forget about direct editing the prefix string inside 'core.img' since
+	// GRUB are forcing LZMA compression for BIOS payloads. And it gets even better,
+	// because even if you're trying to be smart and use GRUB's earlyconfig features
+	// to do something like:
+	//   if [ -e /boot/grub2/i386-pc/normal.mod ]; then set prefix = ...
+	// you still must embed 'configfile.mod' and 'normal.mod' in 'core.img' in order
+	// to do that, which ends up tripling the file size...
+	// Also, as mentioned above, Fedora have started applying *BREAKING* patches
+	// willy-nilly, without bothering to alter the GRUB version string.
+	// Soooo, since the universe is conspiring against us and since we already have
+	// a facility for it, we'll use it to dowload the relevant 'core.img' by
+	// appending a missing version suffix as needed...
+	if (img_report.grub2_version[0] != 0) {
+		if (has_grub_debug_is_enabled)
+			strcat(img_report.grub2_version, "-fedora");
+		if (img_report.has_grub2 > 1)
+			strcat(img_report.grub2_version, "-nonstandard");
+	}
+}
 
 BOOL ExtractISO(const char* src_iso, const char* dest_dir, BOOL scan)
 {
@@ -883,10 +963,6 @@ BOOL ExtractISO(const char* src_iso, const char* dest_dir, BOOL scan)
 
 	if ((!enable_iso) || (src_iso == NULL) || (dest_dir == NULL))
 		return FALSE;
-
-	PF_INIT_OR_OUT(GetFileVersionInfoSizeW, Version);
-	PF_INIT_OR_OUT(GetFileVersionInfoW, Version);
-	PF_INIT_OR_OUT(VerQueryValueA, Version);
 
 	scan_only = scan;
 	if (!scan_only)
@@ -913,6 +989,7 @@ BOOL ExtractISO(const char* src_iso, const char* dest_dir, BOOL scan)
 		}
 		nb_blocks = 0;
 		iso_blocking_status = 0;
+		symlinked_syslinux[0] = 0;
 		StrArrayCreate(&modified_path, 8);
 	}
 
@@ -1092,15 +1169,17 @@ out:
 			img_report.wininst_version = GetInstallWimVersion(src_iso);
 		}
 		if (img_report.has_grub2) {
+			char grub_path[128];
+			static_sprintf(grub_path, "%s/normal.mod", &grub_dirname[img_report.has_grub2 - 1][1]);
 			// In case we have a GRUB2 based iso, we extract boot/grub/i386-pc/normal.mod to parse its version
 			img_report.grub2_version[0] = 0;
 			// coverity[swapped_arguments]
 			if (GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, path) != 0) {
-				size = (size_t)ExtractISOFile(src_iso, "boot/grub/i386-pc/normal.mod", path, FILE_ATTRIBUTE_NORMAL);
+				size = (size_t)ExtractISOFile(src_iso, grub_path, path, FILE_ATTRIBUTE_NORMAL);
 				buf = (char*)calloc(size, 1);
 				fd = fopen(path, "rb");
 				if ((size == 0) || (buf == NULL) || (fd == NULL)) {
-					uprintf("  Could not read Grub version from 'boot/grub/i386-pc/normal.mod'");
+					uprintf("  Could not read Grub version from '%s'", grub_path);
 				} else {
 					fread(buf, 1, size, fd);
 					fclose(fd);
@@ -1109,46 +1188,11 @@ out:
 				free(buf);
 				DeleteFileU(path);
 			}
-			if (img_report.grub2_version[0] != 0)
+			if (img_report.grub2_version[0] != 0) {
 				uprintf("  Detected Grub version: %s", img_report.grub2_version);
-			else {
+			} else {
 				uprintf("  Could not detect Grub version");
-				img_report.has_grub2 = FALSE;
-			}
-		}
-		if (img_report.has_compatresources_dll) {
-			// So that we don't have to extract the XML index from boot/install.wim
-			// to find if we're dealing with Windows 11, we isolate the version from
-			// sources/compatresources.dll, which is much faster...
-			VS_FIXEDFILEINFO* ver_info = NULL;
-			DWORD ver_handle = 0, ver_size;
-			UINT value_len = 0;
-			assert(pfGetFileVersionInfoSizeW != NULL);
-			assert(pfGetFileVersionInfoW != NULL);
-			assert(pfVerQueryValueA != NULL);
-			// coverity[swapped_arguments]
-			if (GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, path) != 0) {
-				wconvert(path);
-				assert(wpath != NULL);
-				size = (size_t)ExtractISOFile(src_iso, "sources/compatresources.dll", path, FILE_ATTRIBUTE_NORMAL);
-				ver_size = pfGetFileVersionInfoSizeW(wpath, &ver_handle);
-				if (ver_size != 0) {
-					buf = malloc(ver_size);
-					if ((buf != NULL) && pfGetFileVersionInfoW(wpath, ver_handle, ver_size, buf) &&
-						pfVerQueryValueA(buf, "\\", (LPVOID)&ver_info, &value_len) && (value_len != 0)) {
-						if (ver_info->dwSignature == VS_FFI_SIGNATURE) {
-							img_report.win_version.major = HIWORD(ver_info->dwFileVersionMS);
-							img_report.win_version.minor = LOWORD(ver_info->dwFileVersionMS);
-							img_report.win_version.build = HIWORD(ver_info->dwFileVersionLS);
-							img_report.win_version.revision = LOWORD(ver_info->dwFileVersionLS);
-							if ((img_report.win_version.major == 10) && (img_report.win_version.build > 20000))
-								img_report.win_version.major = 11;
-						}
-					}
-					free(buf);
-				}
-				DeleteFileW(wpath);
-				free(wpath);
+				img_report.has_grub2 = 0;
 			}
 		}
 		StrArrayDestroy(&config_path);
@@ -1187,6 +1231,42 @@ out:
 			}
 			if (fd != NULL)
 				fclose(fd);
+			// Workaround needed for Knoppix that has a /boot/syslinux that links to /boot/isolinux/
+			// with EFI Syslinux trying to read /boot/syslinux/syslnx[32|64].cfg as the config file.
+			if (symlinked_syslinux[0] != 0) {
+				static const char* efi_cfg_name[] = { "syslnx32.cfg", "syslnx64.cfg" };
+				size_t len = strlen(symlinked_syslinux);
+				char isolinux_dir[MAX_PATH];
+				static_strcpy(isolinux_dir, symlinked_syslinux);
+				assert(len > 8);
+				// ".../syslinux" -> ".../isolinux"
+				isolinux_dir[len - 8] = 'i';
+				isolinux_dir[len - 7] = 's';
+				isolinux_dir[len - 6] = 'o';
+				// Delete the empty syslinux symbolic link remnant and replace it with a syslinux/ dir
+				DeleteFileA(symlinked_syslinux);
+				CreateDirectoryA(symlinked_syslinux, NULL);
+				// Now add the relevant config files that link back to the ones in isolinux/
+				for (i = 0; i < ARRAYSIZE(efi_cfg_name); i++) {
+					static_sprintf(path, "%s/%s", isolinux_dir, efi_cfg_name[i]);
+					if (!PathFileExistsA(path))
+						continue;
+					static_sprintf(path, "%s/%s", symlinked_syslinux, efi_cfg_name[i]);
+					fd = fopen(path, "w");
+					if (fd == NULL) {
+						uprintf("Unable to create %s - booting from USB may not work", path);
+						r = 1;
+						continue;
+					}
+					static_sprintf(path, "%s/%s", isolinux_dir, efi_cfg_name[i]);
+					fprintf(fd, "DEFAULT loadconfig\n\nLABEL loadconfig\n  CONFIG %s\n  APPEND %s\n", &path[2], &isolinux_dir[2]);
+					fclose(fd);
+					to_windows_path(symlinked_syslinux);
+					uprintf("Created: %s\\%s → %s", symlinked_syslinux, efi_cfg_name[i], &path[2]);
+					to_unix_path(symlinked_syslinux);
+					fd = NULL;
+				}
+			}
 		} else if (HAS_BOOTMGR(img_report) && enable_ntfs_compression) {
 			// bootmgr might need to be uncompressed: https://github.com/pbatard/rufus/issues/1381
 			RunCommand("compact /u bootmgr* efi/boot/*.efi", dest_dir, TRUE);
@@ -1199,10 +1279,8 @@ out:
 			bled_exit();
 		}
 	}
-	if (p_iso != NULL)
-		iso9660_close(p_iso);
-	if (p_udf != NULL)
-		udf_close(p_udf);
+	iso9660_close(p_iso);
+	udf_close(p_udf);
 	if ((r != 0) && (FormatStatus == 0))
 		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR((scan_only?ERROR_ISO_SCAN:ERROR_ISO_EXTRACT));
 	return (r == 0);
@@ -1296,23 +1374,17 @@ try_iso:
 
 out:
 	safe_closehandle(file_handle);
-	if (p_statbuf != NULL)
-		safe_free(p_statbuf->rr.psz_symlink);
-	safe_free(p_statbuf);
-	if (p_udf_root != NULL)
-		udf_dirent_free(p_udf_root);
-	if (p_udf_file != NULL)
-		udf_dirent_free(p_udf_file);
-	if (p_iso != NULL)
-		iso9660_close(p_iso);
-	if (p_udf != NULL)
-		udf_close(p_udf);
+	iso9660_stat_free(p_statbuf);
+	udf_dirent_free(p_udf_root);
+	udf_dirent_free(p_udf_file);
+	iso9660_close(p_iso);
+	udf_close(p_udf);
 	return r;
 }
 
 uint32_t GetInstallWimVersion(const char* iso)
 {
-	char *wim_path = NULL, *p, buf[UDF_BLOCKSIZE] = { 0 };
+	char *wim_path = NULL, buf[UDF_BLOCKSIZE] = { 0 };
 	uint32_t* wim_header = (uint32_t*)buf, r = 0xffffffff;
 	iso9660_t* p_iso = NULL;
 	udf_t* p_udf = NULL;
@@ -1324,8 +1396,7 @@ uint32_t GetInstallWimVersion(const char* iso)
 		goto out;
 	// UDF indiscriminately accepts slash or backslash delimiters,
 	// but ISO-9660 requires slash
-	for (p = wim_path; *p != 0; p++)
-		if (*p == '\\') *p = '/';
+	to_unix_path(wim_path);
 
 	// First try to open as UDF - fallback to ISO if it failed
 	p_udf = udf_open(iso);
@@ -1367,17 +1438,11 @@ try_iso:
 	r = wim_header[3];
 
 out:
-	if (p_statbuf != NULL)
-		safe_free(p_statbuf->rr.psz_symlink);
-	safe_free(p_statbuf);
-	if (p_udf_root != NULL)
-		udf_dirent_free(p_udf_root);
-	if (p_udf_file != NULL)
-		udf_dirent_free(p_udf_file);
-	if (p_iso != NULL)
-		iso9660_close(p_iso);
-	if (p_udf != NULL)
-		udf_close(p_udf);
+	iso9660_stat_free(p_statbuf);
+	udf_dirent_free(p_udf_root);
+	udf_dirent_free(p_udf_file);
+	iso9660_close(p_iso);
+	udf_close(p_udf);
 	safe_free(wim_path);
 	return bswap_uint32(r);
 }
@@ -1400,7 +1465,7 @@ int iso9660_readfat(intptr_t pp, void *buf, size_t secsize, libfat_sector_t sec)
 	iso9660_readfat_private* p_private = (iso9660_readfat_private*)pp;
 
 	if (sizeof(p_private->buf) % secsize != 0) {
-		uprintf("iso9660_readfat: Sector size %d is not a divisor of %d", secsize, sizeof(p_private->buf));
+		uprintf("iso9660_readfat: Sector size %zu is not a divisor of %zu", secsize, sizeof(p_private->buf));
 		return 0;
 	}
 
@@ -1496,12 +1561,9 @@ BOOL HasEfiImgBootLoaders(void)
 out:
 	if (lf_fs != NULL)
 		libfat_close(lf_fs);
-	if (p_statbuf != NULL)
-		safe_free(p_statbuf->rr.psz_symlink);
-	safe_free(p_statbuf);
+	iso9660_stat_free(p_statbuf);
+	iso9660_close(p_iso);
 	safe_free(p_private);
-	if (p_iso != NULL)
-		iso9660_close(p_iso);
 	return ret;
 }
 
@@ -1557,7 +1619,6 @@ BOOL DumpFatDir(const char* path, int32_t cluster)
 	}
 
 	do {
-		// coverity[-taint_source]
 		dirpos.cluster = libfat_dumpdir(lf_fs, &dirpos, &diritem);
 		if (dirpos.cluster >= 0) {
 			name = wchar_to_utf8(diritem.name);
@@ -1617,6 +1678,7 @@ BOOL DumpFatDir(const char* path, int32_t cluster)
 			safe_free(target);
 			safe_free(name);
 		}
+	// coverity[tainted_data]
 	} while (dirpos.cluster >= 0);
 	ret = TRUE;
 
@@ -1626,26 +1688,15 @@ out:
 			libfat_close(lf_fs);
 			lf_fs = NULL;
 		}
-		if (p_statbuf != NULL)
-			safe_free(p_statbuf->rr.psz_symlink);
-		safe_free(p_statbuf);
+		iso9660_stat_free(p_statbuf);;
+		iso9660_close(p_iso);
 		safe_free(p_private);
-		if (p_iso != NULL)
-			iso9660_close(p_iso);
 	}
 	safe_closehandle(handle);
 	safe_free(name);
 	safe_free(target);
 	return ret;
 }
-
-// VirtDisk API Prototypes - Only available for Windows 8 or later
-PF_TYPE_DECL(WINAPI, DWORD, OpenVirtualDisk, (PVIRTUAL_STORAGE_TYPE, PCWSTR,
-	VIRTUAL_DISK_ACCESS_MASK, OPEN_VIRTUAL_DISK_FLAG, POPEN_VIRTUAL_DISK_PARAMETERS, PHANDLE));
-PF_TYPE_DECL(WINAPI, DWORD, AttachVirtualDisk, (HANDLE, PSECURITY_DESCRIPTOR,
-	ATTACH_VIRTUAL_DISK_FLAG, ULONG, PATTACH_VIRTUAL_DISK_PARAMETERS, LPOVERLAPPED));
-PF_TYPE_DECL(WINAPI, DWORD, DetachVirtualDisk, (HANDLE, DETACH_VIRTUAL_DISK_FLAG, ULONG));
-PF_TYPE_DECL(WINAPI, DWORD, GetVirtualDiskPhysicalPath, (HANDLE, PULONG, PWSTR));
 
 static char physical_path[128] = "";
 static HANDLE mounted_handle = INVALID_HANDLE_VALUE;
@@ -1660,14 +1711,10 @@ char* MountISO(const char* path)
 	wconvert(path);
 	char* ret = NULL;
 
-	PF_INIT_OR_OUT(OpenVirtualDisk, VirtDisk);
-	PF_INIT_OR_OUT(AttachVirtualDisk, VirtDisk);
-	PF_INIT_OR_OUT(GetVirtualDiskPhysicalPath, VirtDisk);
-
 	if ((mounted_handle != NULL) && (mounted_handle != INVALID_HANDLE_VALUE))
 		UnMountISO();
 
-	r = pfOpenVirtualDisk(&vtype, wpath, VIRTUAL_DISK_ACCESS_READ | VIRTUAL_DISK_ACCESS_GET_INFO,
+	r = OpenVirtualDisk(&vtype, wpath, VIRTUAL_DISK_ACCESS_READ | VIRTUAL_DISK_ACCESS_GET_INFO,
 		OPEN_VIRTUAL_DISK_FLAG_NONE, NULL, &mounted_handle);
 	if (r != ERROR_SUCCESS) {
 		SetLastError(r);
@@ -1676,7 +1723,7 @@ char* MountISO(const char* path)
 	}
 
 	vparams.Version = ATTACH_VIRTUAL_DISK_VERSION_1;
-	r = pfAttachVirtualDisk(mounted_handle, NULL, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY |
+	r = AttachVirtualDisk(mounted_handle, NULL, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY |
 		ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, 0, &vparams, NULL);
 	if (r != ERROR_SUCCESS) {
 		SetLastError(r);
@@ -1684,7 +1731,7 @@ char* MountISO(const char* path)
 		goto out;
 	}
 
-	r = pfGetVirtualDiskPhysicalPath(mounted_handle, &size, wtmp);
+	r = GetVirtualDiskPhysicalPath(mounted_handle, &size, wtmp);
 	if (r != ERROR_SUCCESS) {
 		SetLastError(r);
 		uprintf("Could not obtain physical path for mounted ISO '%s': %s", path, WindowsErrorString());
@@ -1702,12 +1749,10 @@ out:
 
 void UnMountISO(void)
 {
-	PF_INIT_OR_OUT(DetachVirtualDisk, VirtDisk);
-
 	if ((mounted_handle == NULL) || (mounted_handle == INVALID_HANDLE_VALUE))
 		goto out;
 
-	pfDetachVirtualDisk(mounted_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+	DetachVirtualDisk(mounted_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
 	safe_closehandle(mounted_handle);
 out:
 	physical_path[0] = 0;

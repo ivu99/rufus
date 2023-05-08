@@ -1,11 +1,30 @@
-# Disabled on account of https://github.com/github/codeql-action/issues/850
 name: "CodeQL"
 
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - '.gitignore'
+      - '.gitattributes'
+      - 'res/**'
+      - '**.cmd'
+      - '**.md'
+      - '**.rc'
+      - '**.sh'
+      - '**.txt'
+      - '**.xml'
   pull_request:
     branches: [master]
+    paths-ignore:
+      - '.gitignore'
+      - '.gitattributes'
+      - 'res/**'
+      - '**.cmd'
+      - '**.md'
+      - '**.rc'
+      - '**.sh'
+      - '**.txt'
+      - '**.xml'
 
 env:
   SOLUTION_FILE_PATH: ./rufus.sln
@@ -14,22 +33,22 @@ env:
 
 jobs:
   CodeQL-Build:
-    runs-on: windows-2022
+    runs-on: windows-latest
 
     permissions:
       security-events: write
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v1
+      uses: github/codeql-action/init@v2
       with:
         languages: cpp
 
     - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v1.1
+      uses: microsoft/setup-msbuild@v1
       with:
         msbuild-architecture: x64
 
@@ -37,4 +56,4 @@ jobs:
       run: msbuild ${{env.SOLUTION_FILE_PATH}} /m /p:Configuration=${{ env.BUILD_CONFIGURATION}},Platform=${{ env.TARGET_PLATFORM }}
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v1
+      uses: github/codeql-action/analyze@v2

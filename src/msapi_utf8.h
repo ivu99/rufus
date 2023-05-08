@@ -6,7 +6,7 @@
  *
  * See also: https://utf8everywhere.org
  *
- * Copyright © 2010-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2010-2023 Pete Batard <pete@akeo.ie>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -345,6 +345,8 @@ static __inline int GetWindowTextU(HWND hWnd, char* lpString, int nMaxCount)
 {
 	int ret = 0;
 	DWORD err = ERROR_INVALID_DATA;
+	if (nMaxCount < 0)
+		return 0;
 	// Handle the empty string as GetWindowTextW() returns 0 then
 	if ((lpString != NULL) && (nMaxCount > 0))
 		lpString[0] = 0;
@@ -357,6 +359,8 @@ static __inline int GetWindowTextU(HWND hWnd, char* lpString, int nMaxCount)
 		err = GetLastError();
 	}
 	wfree(lpString);
+	if (lpString != NULL)
+		lpString[nMaxCount - 1] = 0;
 	SetLastError(err);
 	return ret;
 }
@@ -1236,6 +1240,33 @@ static __inline BOOL SetupDiGetDeviceRegistryPropertyU(HDEVINFO DeviceInfoSet, P
 		ret = FALSE;
 	}
 	wfree(PropertyBuffer);
+	SetLastError(err);
+	return ret;
+}
+
+// NB: This does not support the ERROR_INSUFFICIENT_BUFFER dance to retrieve the required buffer size
+static __inline BOOL GetUserNameU(LPSTR lpBuffer, LPDWORD pcbBuffer)
+{
+	BOOL ret;
+	DWORD err, size;
+	if (lpBuffer == NULL || pcbBuffer == NULL) {
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
+	size = *pcbBuffer;
+	// coverity[returned_null]
+	walloc(lpBuffer, size);
+	ret = GetUserNameW(wlpBuffer, &size);
+	err = GetLastError();
+	if (ret) {
+		*pcbBuffer = (DWORD)wchar_to_utf8_no_alloc(wlpBuffer, lpBuffer, size);
+		if (*pcbBuffer == 0)
+			err = GetLastError();
+		else
+			// Reported size includes the NUL terminator
+			(*pcbBuffer)++;
+	}
+	wfree(lpBuffer);
 	SetLastError(err);
 	return ret;
 }

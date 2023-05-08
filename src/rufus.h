@@ -1,6 +1,6 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
- * Copyright © 2011-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2023 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -63,7 +63,6 @@
 #define MIN_DRIVE_SIZE              8			// Minimum size a drive must have, to be formattable (in MB)
 #define MIN_EXTRA_PART_SIZE         (1024*1024)	// Minimum size of the extra partition, in bytes
 #define MIN_EXT_SIZE                (256*1024*1024)	// Minimum size we allow for ext formatting
-#define MAX_ARCHS                   9			// Number of arhitectures we recognize
 #define MAX_DRIVES                  (DRIVE_INDEX_MAX - DRIVE_INDEX_MIN)
 #define MAX_TOOLTIPS                128
 #define MAX_SIZE_SUFFIXES           6			// bytes, KB, MB, GB, TB, PB
@@ -75,9 +74,11 @@
 #define MAX_GUID_STRING_LENGTH      40
 #define MAX_PARTITIONS              16			// Maximum number of partitions we handle
 #define MAX_ESP_TOGGLE              8			// Maximum number of entries we record to toggle GPT ESP back and forth
+#define MAX_IGNORE_USB              8			// Maximum number of USB drives we want to ignore
 #define MAX_ISO_TO_ESP_SIZE         512			// Maximum size we allow for the ISO → ESP option (in MB)
 #define MAX_DEFAULT_LIST_CARD_SIZE  200			// Size above which we don't list a card without enable HDD or Alt-F (in GB)
 #define MAX_SECTORS_TO_CLEAR        128			// nb sectors to zap when clearing the MBR/GPT (must be >34)
+#define MAX_USERNAME_LENGTH         128			// Maximum size we'll accept for a WUE specified username
 #define MAX_WININST                 4			// Max number of install[.wim|.esd] we can handle on an image
 #define MBR_UEFI_MARKER             0x49464555	// 'U', 'E', 'F', 'I', as a 32 bit little endian longword
 #define MORE_INFO_URL               0xFFFF
@@ -85,11 +86,7 @@
 #define STATUS_MSG_TIMEOUT          3500		// How long should cheat mode messages appear for on the status bar
 #define WRITE_RETRIES               4
 #define WRITE_TIMEOUT               5000		// How long we should wait between write retries (in ms)
-#if defined(_DEBUG)
-#define SEARCH_PROCESS_TIMEOUT      60000
-#else
 #define SEARCH_PROCESS_TIMEOUT      10000		// How long we should search for conflicting processes before giving up (in ms)
-#endif
 #define NET_SESSION_TIMEOUT         3500		// How long we should wait to connect, send or receive internet data
 #define MARQUEE_TIMER_REFRESH       10			// Time between progress bar marquee refreshes, in ms
 #define FS_DEFAULT                  FS_FAT32
@@ -112,7 +109,7 @@
 #define RSA_SIGNATURE_SIZE          256
 #define CBN_SELCHANGE_INTERNAL      (CBN_SELCHANGE + 256)
 #if defined(RUFUS_TEST)
-#define RUFUS_URL                   "http://nano/~rufus"
+#define RUFUS_URL                   "http://nas/~rufus"
 #else
 #define RUFUS_URL                   "https://rufus.ie"
 #endif
@@ -161,29 +158,32 @@
 #define safe_release_dc(hDlg, hDC) do {if ((hDC != INVALID_HANDLE_VALUE) && (hDC != NULL)) {ReleaseDC(hDlg, hDC); hDC = NULL;}} while(0)
 #define safe_sprintf(dst, count, ...) do {_snprintf(dst, count, __VA_ARGS__); (dst)[(count)-1] = 0; } while(0)
 #define static_sprintf(dst, ...) safe_sprintf(dst, sizeof(dst), __VA_ARGS__)
+#define safe_atoi(str) ((((char*)(str))==NULL)?0:atoi(str))
 #define safe_strlen(str) ((((char*)(str))==NULL)?0:strlen(str))
-#define safe_strdup _strdup
-#define to_windows_path(str) do { size_t __i; for (__i = 0; __i < safe_strlen(str); __i++) if (str[__i] == '/') str[__i] = '\\'; } while(0)
+#define safe_strdup(str) ((((char*)(str))==NULL)?NULL:_strdup(str))
 #if defined(_MSC_VER)
 #define safe_vsnprintf(buf, size, format, arg) _vsnprintf_s(buf, size, _TRUNCATE, format, arg)
 #else
 #define safe_vsnprintf vsnprintf
 #endif
+static __inline void static_repchr(char* p, char s, char r) {
+	if (p != NULL) while (*p != 0) { if (*p == s) *p = r; p++; }
+}
+#define to_unix_path(str) static_repchr(str, '\\', '/')
+#define to_windows_path(str) static_repchr(str, '/', '\\')
 
-extern void _uprintf(const char *format, ...);
-extern void _uprintfs(const char *str);
-#define uprintf(...) _uprintf(__VA_ARGS__)
-#define uprintfs(s) _uprintfs(s)
-#define vuprintf(...) do { if (verbose) _uprintf(__VA_ARGS__); } while(0)
-#define vvuprintf(...) do { if (verbose > 1) _uprintf(__VA_ARGS__); } while(0)
-#define suprintf(...) do { if (!bSilent) _uprintf(__VA_ARGS__); } while(0)
-#define uuprintf(...) do { if (usb_debug) _uprintf(__VA_ARGS__); } while(0)
+extern void uprintf(const char *format, ...);
+extern void uprintfs(const char *str);
+#define vuprintf(...) do { if (verbose) uprintf(__VA_ARGS__); } while(0)
+#define vvuprintf(...) do { if (verbose > 1) uprintf(__VA_ARGS__); } while(0)
+#define suprintf(...) do { if (!bSilent) uprintf(__VA_ARGS__); } while(0)
+#define uuprintf(...) do { if (usb_debug) uprintf(__VA_ARGS__); } while(0)
 #define ubprintf(...) do { safe_sprintf(&ubuffer[ubuffer_pos], UBUFFER_SIZE - ubuffer_pos - 4, __VA_ARGS__); \
 	ubuffer_pos = strlen(ubuffer); ubuffer[ubuffer_pos++] = '\r'; ubuffer[ubuffer_pos++] = '\n'; \
 	ubuffer[ubuffer_pos] = 0; } while(0)
 #define ubflush() do { if (ubuffer_pos) uprintf("%s", ubuffer); ubuffer_pos = 0; } while(0)
 #ifdef _DEBUG
-#define duprintf(...) _uprintf(__VA_ARGS__)
+#define duprintf uprintf
 #else
 #define duprintf(...)
 #endif
@@ -310,6 +310,12 @@ enum checksum_type {
 	CHECKSUM_MAX
 };
 
+enum file_io_type {
+	FILE_IO_READ = 0,
+	FILE_IO_WRITE,
+	FILE_IO_APPEND
+};
+
 /* Special handling for old .c32 files we need to replace */
 #define NB_OLD_C32          2
 #define OLD_C32_NAMES       { "menu.c32", "vesamenu.c32" }
@@ -332,6 +338,8 @@ enum checksum_type {
 #define HAS_WINPE(r)        (((r.winpe & WINPE_I386) == WINPE_I386)||((r.winpe & WINPE_AMD64) == WINPE_AMD64)||((r.winpe & WINPE_MININT) == WINPE_MININT))
 #define HAS_WINDOWS(r)      (HAS_BOOTMGR(r) || (r.uses_minint) || HAS_WINPE(r))
 #define HAS_WIN7_EFI(r)     ((r.has_efi == 1) && HAS_WININST(r))
+#define IS_WINDOWS_1X(r)    (r.has_bootmgr_efi && (r.win_version.major >= 10))
+#define IS_WINDOWS_11(r)    (r.has_bootmgr_efi && (r.win_version.major >= 11))
 #define HAS_EFI_IMG(r)      (r.efi_img_path[0] != 0)
 #define IS_DD_BOOTABLE(r)   (r.is_bootable_img > 0)
 #define IS_DD_ONLY(r)       ((r.is_bootable_img > 0) && (!r.is_iso || r.disable_iso))
@@ -339,7 +347,8 @@ enum checksum_type {
 #define IS_BIOS_BOOTABLE(r) (HAS_BOOTMGR(r) || HAS_SYSLINUX(r) || HAS_WINPE(r) || HAS_GRUB(r) || HAS_REACTOS(r) || HAS_KOLIBRIOS(r))
 #define HAS_WINTOGO(r)      (HAS_BOOTMGR(r) && IS_EFI_BOOTABLE(r) && HAS_WININST(r))
 #define HAS_PERSISTENCE(r)  ((HAS_SYSLINUX(r) || HAS_GRUB(r)) && !(HAS_WINDOWS(r) || HAS_REACTOS(r) || HAS_KOLIBRIOS(r)))
-#define IS_FAT(fs)          ((fs_type == FS_FAT16) || (fs_type == FS_FAT32))
+#define IS_FAT(fs)          ((fs == FS_FAT16) || (fs == FS_FAT32))
+#define IS_EXT(fs)          ((fs >= FS_EXT2) && (fs <= FS_EXT4))
 #define SYMLINKS_RR         0x01
 #define SYMLINKS_UDF        0x02
 
@@ -384,7 +393,7 @@ typedef struct {
 	BOOLEAN has_efi_syslinux;
 	BOOLEAN needs_syslinux_overwrite;
 	BOOLEAN has_grub4dos;
-	BOOLEAN has_grub2;
+	uint8_t has_grub2;
 	BOOLEAN has_compatresources_dll;
 	BOOLEAN has_kolibrios;
 	BOOLEAN uses_casper;
@@ -394,12 +403,23 @@ typedef struct {
 	uint16_t sl_version;	// Syslinux/Isolinux version
 	char sl_version_str[12];
 	char sl_version_ext[32];
-	char grub2_version[32];
+	char grub2_version[64];
 } RUFUS_IMG_REPORT;
 
 /* Isolate the Syslinux version numbers */
 #define SL_MAJOR(x) ((uint8_t)((x)>>8))
 #define SL_MINOR(x) ((uint8_t)(x))
+
+typedef struct {
+	char* id;
+	char* name;
+	char* display_name;
+	char* label;
+	char* hub;
+	DWORD index;
+	uint32_t port;
+	uint64_t size;
+} RUFUS_DRIVE;
 
 typedef struct {
 	uint16_t version[3];
@@ -444,7 +464,7 @@ typedef struct ext_t {
 	EXT_D(var, descriptions);                                               \
 	ext_t var = { ARRAYSIZE(_##var##_x), filename, _##var##_x, _##var##_d }
 
-/* Duplication of the TBPFLAG enum for Windows 7 taskbar progress */
+/* Duplication of the TBPFLAG enum for Windows taskbar progress */
 typedef enum TASKBAR_PROGRESS_FLAGS
 {
 	TASKBAR_NOPROGRESS = 0,
@@ -454,10 +474,55 @@ typedef enum TASKBAR_PROGRESS_FLAGS
 	TASKBAR_PAUSED = 0x8
 } TASKBAR_PROGRESS_FLAGS;
 
+/* We can't use the Microsoft enums as we want to have RISC-V */
+enum ArchType {
+	ARCH_UNKNOWN = 0,
+	ARCH_X86_32,
+	ARCH_X86_64,
+	ARCH_ARM_32,
+	ARCH_ARM_64,
+	ARCH_IA_64,
+	ARCH_RISCV_32,
+	ARCH_RISCV_64,
+	ARCH_RISCV_128,
+	ARCH_EBC,
+	ARCH_MAX
+};
+
+static __inline USHORT GetApplicationArch(void)
+{
+#if defined(_M_AMD64)
+	return IMAGE_FILE_MACHINE_AMD64;
+#elif defined(_M_IX86)
+	return IMAGE_FILE_MACHINE_I386;
+#elif defined(_M_ARM64)
+	return IMAGE_FILE_MACHINE_ARM64;
+#elif defined(_M_ARM)
+	return IMAGE_FILE_MACHINE_ARM;
+#else
+	return IMAGE_FILE_MACHINE_UNKNOWN;
+#endif
+}
+
+static __inline const char* GetArchName(USHORT uArch)
+{
+	switch (uArch) {
+	case IMAGE_FILE_MACHINE_AMD64:
+		return "x64";
+	case IMAGE_FILE_MACHINE_I386:
+		return "x86";
+	case IMAGE_FILE_MACHINE_ARM64:
+		return "arm64";
+	case IMAGE_FILE_MACHINE_ARM:
+		return "arm";
+	default:
+		return "unknown";
+	}
+}
+
 /* Windows versions */
 enum WindowsVersion {
-	WINDOWS_UNDEFINED = -1,
-	WINDOWS_UNSUPPORTED = 0,
+	WINDOWS_UNDEFINED = 0,
 	WINDOWS_XP = 0x51,
 	WINDOWS_2003 = 0x52,	// Also XP_64
 	WINDOWS_VISTA = 0x60,	// Also Server 2008
@@ -467,17 +532,38 @@ enum WindowsVersion {
 	WINDOWS_10_PREVIEW1 = 0x64,
 	WINDOWS_10 = 0xA0,		// Also Server 2016, also Server 2019
 	WINDOWS_11 = 0xB0,		// Also Server 2022
-	WINDOWS_MAX
+	WINDOWS_MAX = 0xFFFF,
 };
 
-enum CpuArch {
-	CPU_ARCH_X86_32 = 0,
-	CPU_ARCH_X86_64,
-	CPU_ARCH_ARM_32,
-	CPU_ARCH_ARM_64,
-	CPU_ARCH_UNDEFINED,
-	CPU_ARCH_MAX
-};
+typedef struct {
+	DWORD Version;
+	DWORD Major;
+	DWORD Minor;
+	DWORD BuildNumber;
+	DWORD Ubr;
+	DWORD Edition;
+	USHORT Arch;
+	char VersionStr[128];
+} windows_version_t;
+
+// Windows User Experience (unattend.xml) flags and masks
+#define UNATTEND_SECUREBOOT_TPM_MINRAM      0x00001
+#define UNATTEND_NO_ONLINE_ACCOUNT          0x00004
+#define UNATTEND_NO_DATA_COLLECTION         0x00008
+#define UNATTEND_OFFLINE_INTERNAL_DRIVES    0x00010
+#define UNATTEND_DUPLICATE_LOCALE           0x00020
+#define UNATTEND_SET_USER                   0x00040
+#define UNATTEND_DISABLE_BITLOCKER          0x00080
+#define UNATTEND_DEFAULT_MASK               0x000FF
+#define UNATTEND_WINDOWS_TO_GO              0x10000		// Special flag for Windows To Go
+
+#define UNATTEND_WINPE_SETUP_MASK           (UNATTEND_SECUREBOOT_TPM_MINRAM)
+#define UNATTEND_SPECIALIZE_DEPLOYMENT_MASK (UNATTEND_NO_ONLINE_ACCOUNT)
+#define UNATTEND_OOBE_SHELL_SETUP_MASK      (UNATTEND_NO_DATA_COLLECTION | UNATTEND_SET_USER)
+#define UNATTEND_OOBE_INTERNATIONAL_MASK    (UNATTEND_DUPLICATE_LOCALE)
+#define UNATTEND_OOBE_MASK                  (UNATTEND_OOBE_SHELL_SETUP_MASK | UNATTEND_OOBE_INTERNATIONAL_MASK | UNATTEND_DISABLE_BITLOCKER)
+#define UNATTEND_OFFLINE_SERVICING_MASK     (UNATTEND_OFFLINE_INTERNAL_DRIVES)
+#define UNATTEND_DEFAULT_SELECTION_MASK     (UNATTEND_SECUREBOOT_TPM_MINRAM | UNATTEND_NO_ONLINE_ACCOUNT | UNATTEND_OFFLINE_INTERNAL_DRIVES)
 
 /*
  * Globals
@@ -499,20 +585,18 @@ extern uint64_t persistence_size;
 extern size_t ubuffer_pos;
 extern const int nb_steps[FS_MAX];
 extern float fScale;
-extern int nWindowsVersion, nWindowsBuildNumber, nWindowsEdition, dialog_showing, force_update;
-extern int fs_type, boot_type, partition_type, target_type;
+extern windows_version_t WindowsVersion;
+extern int dialog_showing, force_update, fs_type, boot_type, partition_type, target_type;
 extern unsigned long syslinux_ldlinux_len[2];
-extern char WindowsVersionStr[128], ubuffer[UBUFFER_SIZE], embedded_sl_version_str[2][12];
+extern char ubuffer[UBUFFER_SIZE], embedded_sl_version_str[2][12];
 extern char szFolderPath[MAX_PATH], app_dir[MAX_PATH], temp_dir[MAX_PATH], system_dir[MAX_PATH], sysnative_dir[MAX_PATH];
 extern char app_data_dir[MAX_PATH], *image_path, *fido_url;
 
 /*
  * Shared prototypes
  */
-extern void GetWindowsVersion(void);
-extern BOOL is_x64(void);
-extern BOOL GetCpuArch(void);
-extern const char *WindowsErrorString(void);
+extern void GetWindowsVersion(windows_version_t* WindowsVersion);
+extern const char* WindowsErrorString(void);
 extern void DumpBufferHex(void *buf, size_t size);
 extern void PrintStatusInfo(BOOL info, BOOL debug, unsigned int duration, int msg_id, ...);
 #define PrintStatus(...) PrintStatusInfo(FALSE, FALSE, __VA_ARGS__)
@@ -545,7 +629,8 @@ extern BOOL CreateTooltip(HWND hControl, const char* message, int duration);
 extern void DestroyTooltip(HWND hWnd);
 extern void DestroyAllTooltips(void);
 extern BOOL Notification(int type, const char* dont_display_setting, const notification_info* more_info, char* title, char* format, ...);
-extern int SelectionDialog(char* title, char* message, char** choices, int size);
+extern int CustomSelectionDialog(int style, char* title, char* message, char** choices, int size, int mask, int username_index);
+#define SelectionDialog(title, message, choices, size) CustomSelectionDialog(BS_AUTORADIOBUTTON, title, message, choices, size, 1, -1)
 extern void ListDialog(char* title, char* message, char** items, int size);
 extern SIZE GetTextSize(HWND hCtrl, char* txt);
 extern BOOL ExtractAppIcon(const char* filename, BOOL bSilent);
@@ -560,7 +645,7 @@ extern BOOL InstallSyslinux(DWORD drive_index, char drive_letter, int fs);
 extern uint16_t GetSyslinuxVersion(char* buf, size_t buf_size, char** ext);
 extern BOOL SetAutorun(const char* path);
 extern char* FileDialog(BOOL save, char* path, const ext_t* ext, DWORD options);
-extern BOOL FileIO(BOOL save, char* path, char** buffer, DWORD* size);
+extern BOOL FileIO(enum file_io_type io_type, char* path, char** buffer, DWORD* size);
 extern unsigned char* GetResource(HMODULE module, char* name, char* type, const char* desc, DWORD* len, BOOL duplicate);
 extern DWORD GetResourceSize(HMODULE module, char* name, char* type, const char* desc);
 extern DWORD RunCommand(const char* cmdline, const char* dir, BOOL log);
@@ -591,16 +676,6 @@ extern char* replace_in_token_data(const char* filename, const char* token, cons
 extern char* replace_char(const char* src, const char c, const char* rep);
 extern void parse_update(char* buf, size_t len);
 extern void* get_data_from_asn1(const uint8_t* buf, size_t buf_len, const char* oid_str, uint8_t asn1_type, size_t* data_len);
-extern uint8_t WimExtractCheck(BOOL bSilent);
-extern BOOL WimExtractFile(const char* wim_image, int index, const char* src, const char* dst, BOOL bSilent);
-extern BOOL WimExtractFile_API(const char* image, int index, const char* src, const char* dst, BOOL bSilent);
-extern BOOL WimExtractFile_7z(const char* image, int index, const char* src, const char* dst, BOOL bSilent);
-extern BOOL WimApplyImage(const char* image, int index, const char* dst);
-extern char* WimMountImage(const char* image, int index);
-extern BOOL WimUnmountImage(const char* image, int index);
-extern int8_t IsBootableImage(const char* path);
-extern BOOL AppendVHDFooter(const char* vhd_path);
-extern int SetWinToGoIndex(void);
 extern int IsHDD(DWORD DriveIndex, uint16_t vid, uint16_t pid, const char* strid);
 extern char* GetSignatureName(const char* path, const char* country_code, BOOL bSilent);
 extern uint64_t GetSignatureTimeStamp(const char* path);
@@ -609,6 +684,9 @@ extern BOOL ValidateOpensslSignature(BYTE* pbBuffer, DWORD dwBufferLen, BYTE* pb
 extern BOOL IsFontAvailable(const char* font_name);
 extern BOOL WriteFileWithRetry(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
 	LPDWORD lpNumberOfBytesWritten, DWORD nNumRetries);
+extern HANDLE CreateFileWithTimeout(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+	LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
+	HANDLE hTemplateFile, DWORD dwTimeOut);
 extern BOOL SetThreadAffinity(DWORD_PTR* thread_affinity, size_t num_threads);
 extern BOOL HashFile(const unsigned type, const char* path, uint8_t* sum);
 extern BOOL HashBuffer(const unsigned type, const uint8_t* buf, const size_t len, uint8_t* sum);
@@ -618,7 +696,7 @@ extern BOOL IsBufferInDB(const unsigned char* buf, const size_t len);
 #define printbitslz(x) _printbits(sizeof(x), &x, 1)
 extern char* _printbits(size_t const size, void const * const ptr, int leading_zeroes);
 extern BOOL IsCurrentProcessElevated(void);
-extern char* GetCurrentMUI(void);
+extern char* ToLocaleName(DWORD lang_id);
 extern void SetAlertPromptMessages(void);
 extern BOOL SetAlertPromptHook(void);
 extern void ClrAlertPromptHook(void);
@@ -633,7 +711,6 @@ extern HANDLE CreatePreallocatedFile(const char* lpFileName, DWORD dwDesiredAcce
 	DWORD dwFlagsAndAttributes, LONGLONG fileSize);
 #define GetTextWidth(hDlg, id) GetTextSize(GetDlgItem(hDlg, id), NULL).cx
 
-DWORD WINAPI FormatThread(void* param);
 DWORD WINAPI SaveImageThread(void* param);
 DWORD WINAPI SumThread(void* param);
 
@@ -701,11 +778,6 @@ static __inline HMODULE GetLibraryHandle(char* szLibraryName) {
 		goto out;
 	}
 	h = LoadLibraryExW(wszLibraryName, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-	// Some Windows 7 platforms (most likely the ones missing KB2533623 per the
-	// official LoadLibraryEx doc) can return ERROR_INVALID_PARAMETER when using
-	// the Ex() version. If that's the case, fallback to using LoadLibraryW().
-	if ((h == NULL) && (SCODE_CODE(GetLastError()) == ERROR_INVALID_PARAMETER))
-		h = LoadLibraryW(wszLibraryName);
 	if (h != NULL)
 		OpenedLibrariesHandle[OpenedLibrariesHandleSize++] = h;
 	else
@@ -724,6 +796,14 @@ out:
 	#proc, #name, WindowsErrorString()); goto out;} } while(0)
 #define PF_INIT_OR_SET_STATUS(proc, name)	do {PF_INIT(proc, name);         \
 	if ((pf##proc == NULL) && (NT_SUCCESS(status))) status = STATUS_NOT_IMPLEMENTED; } while(0)
+#if defined(_MSC_VER)
+#define TRY_AND_HANDLE(exception, TRY_CODE, EXCEPTION_CODE) __try TRY_CODE   \
+	__except (GetExceptionCode() == exception ? EXCEPTION_EXECUTE_HANDLER :  \
+			  EXCEPTION_CONTINUE_SEARCH) EXCEPTION_CODE
+#else
+// NB: Eventually we may try __try1 and __except1 from MinGW...
+#define TRY_AND_HANDLE(exception, TRY_CODE, EXCEPTION_CODE) TRY_CODE
+#endif
 
 /* Custom application errors */
 #define FAC(f)                         ((f)<<16)

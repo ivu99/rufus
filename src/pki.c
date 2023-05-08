@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * PKI functions (code signing, etc.)
- * Copyright © 2015-2022 Pete Batard <pete@akeo.ie>
+ * Copyright © 2015-2023 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -539,14 +539,15 @@ uint64_t GetSignatureTimeStamp(const char* path)
 	timestamp = GetRFC3161TimeStamp(pSignerInfo);
 	if (timestamp)
 		uprintf("Note: '%s' has timestamp %s", (path==NULL)?mpath:path, TimestampToHumanReadable(timestamp));
-	// Because we are currently using both SHA-1 and SHA-256 signatures, we are in the very specific
-	// situation that Windows may say our executable passes Authenticode validation on Windows 7 or
-	// later (which includes timestamp validation) even if the SHA-1 signature or timestamps have
-	// been altered.
-	// This means that, if we don't also check the nested SHA-256 signature timestamp, an attacker
-	// could alter the SHA-1 one (which is the one we use by default for chronology validation) and
+	// Because we were using both SHA-1 and SHA-256 signatures during the SHA-256 transition, we were
+	// in the very specific situation where Windows could say that our executable passed Authenticode
+	// validation even if the SHA-1 signature or timestamps had been altered.
+	// This means that, unless we also check the nested signature timestamp, an attacker could alter
+	// the most vulnerable signature (which may also be the one used for chronology validation) and
 	// trick us into using an invalid timestamp value. To prevent this, we validate that, if we have
 	// both a regular and nested timestamp, they are within 60 seconds of each other.
+	// Even as we are no longer dual signing with two versions of SHA, we keep the code in case a
+	// major SHA-256 vulnerability is found and we have to go through a dual SHA again.
 	nested_timestamp = GetNestedRFC3161TimeStamp(pSignerInfo);
 	if (nested_timestamp)
 		uprintf("Note: '%s' has nested timestamp %s", (path==NULL)?mpath:path, TimestampToHumanReadable(nested_timestamp));
@@ -575,8 +576,6 @@ LONG ValidateSignature(HWND hDlg, const char* path)
 	LONG r = TRUST_E_SYSTEM_ERROR;
 	WINTRUST_DATA trust_data = { 0 };
 	WINTRUST_FILE_INFO trust_file = { 0 };
-	PF_TYPE_DECL(WINAPI, long, WinVerifyTrustEx, (HWND, GUID*, WINTRUST_DATA*));
-	PF_INIT(WinVerifyTrustEx, WinTrust);
 	GUID guid_generic_verify =	// WINTRUST_ACTION_GENERIC_VERIFY_V2
 		{ 0xaac56b, 0xcd44, 0x11d0,{ 0x8c, 0xc2, 0x0, 0xc0, 0x4f, 0xc2, 0x95, 0xee } };
 	char *signature_name;
@@ -627,8 +626,9 @@ LONG ValidateSignature(HWND hDlg, const char* path)
 	trust_data.dwUnionChoice = WTD_CHOICE_FILE;
 	trust_data.pFile = &trust_file;
 
-	if (pfWinVerifyTrustEx != NULL)
-		r = pfWinVerifyTrustEx(INVALID_HANDLE_VALUE, &guid_generic_verify, &trust_data);
+	// NB: Calling this API will create DLL sideloading issues through 'msasn1.dll'.
+	// So make sure you delay-load 'wintrust.dll' in your application.
+	r = WinVerifyTrustEx(INVALID_HANDLE_VALUE, &guid_generic_verify, &trust_data);
 	safe_free(trust_file.pcwszFilePath);
 	switch (r) {
 	case ERROR_SUCCESS:

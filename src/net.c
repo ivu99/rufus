@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Networking functionality (web file download, check for update, etc.)
- * Copyright © 2012-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2012-2023 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -52,7 +52,7 @@ HANDLE update_check_thread = NULL;
 
 extern loc_cmd* selected_locale;
 extern HANDLE dialog_handle;
-extern BOOL is_x86_32;
+extern BOOL is_x86_64;
 static DWORD error_code, fido_len = 0;
 static BOOL force_update_check = FALSE;
 static const char* request_headers = "Accept-Encoding: gzip, deflate";
@@ -265,6 +265,13 @@ static char* GetShortName(const char* url)
 	return short_name;
 }
 
+static __inline BOOL is_WOW64(void)
+{
+	BOOL ret = FALSE;
+	IsWow64Process(GetCurrentProcess(), &ret);
+	return ret;
+}
+
 // Open an Internet session
 static HINTERNET GetInternetSession(BOOL bRetry)
 {
@@ -307,9 +314,9 @@ static HINTERNET GetInternetSession(BOOL bRetry)
 		SetLastError(ERROR_INTERNET_DISCONNECTED);
 		goto out;
 	}
-	static_sprintf(agent, APPLICATION_NAME "/%d.%d.%d (Windows NT %d.%d%s)",
+	static_sprintf(agent, APPLICATION_NAME "/%d.%d.%d (Windows NT %lu.%lu%s)",
 		rufus_version[0], rufus_version[1], rufus_version[2],
-		nWindowsVersion >> 4, nWindowsVersion & 0x0F, is_x64() ? "; WOW64" : "");
+		WindowsVersion.Major, WindowsVersion.Minor, is_WOW64() ? "; WOW64" : "");
 	hSession = pfInternetOpenA(agent, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
 	// Set the timeouts
 	pfInternetSetOptionA(hSession, INTERNET_OPTION_CONNECT_TIMEOUT, (LPVOID)&dwTimeout, sizeof(dwTimeout));
@@ -349,6 +356,7 @@ uint64_t DownloadToFileOrBuffer(const char* url, const char* file, BYTE** buffer
 	uint64_t size = 0, total_size = 0;
 
 	// Can't link with wininet.lib because of sideloading issues
+	// And we can't delay-load wininet.dll with MinGW either because the application simply exits on startup...
 	PF_TYPE_DECL(WINAPI, BOOL, InternetCrackUrlA, (LPCSTR, DWORD, DWORD, LPURL_COMPONENTSA));
 	PF_TYPE_DECL(WINAPI, HINTERNET, InternetConnectA, (HINTERNET, LPCSTR, INTERNET_PORT, LPCSTR, LPCSTR, DWORD, DWORD, DWORD_PTR));
 	PF_TYPE_DECL(WINAPI, BOOL, InternetReadFile, (HINTERNET, LPVOID, DWORD, LPDWORD));
@@ -427,7 +435,7 @@ uint64_t DownloadToFileOrBuffer(const char* url, const char* file, BYTE** buffer
 		uprintf("Unable to retrieve file length: %s", WinInetErrorString());
 		goto out;
 	}
-	total_size = (uint64_t)atoll(strsize);
+	total_size = strtoull(strsize, NULL, 10);
 	if (hProgressDialog != NULL) {
 		char msg[128];
 		uprintf("File length: %s", SizeToHumanReadable(total_size, FALSE, FALSE));
@@ -607,11 +615,11 @@ HANDLE DownloadSignedFileThreaded(const char* url, const char* file, HWND hProgr
 	return CreateThread(NULL, 0, DownloadSignedFileThread, &args, 0, NULL);
 }
 
-static __inline uint64_t to_uint64_t(uint16_t x[4]) {
+static __inline uint64_t to_uint64_t(uint16_t x[3]) {
 	int i;
 	uint64_t ret = 0;
-	for (i=0; i<3; i++)
-		ret = (ret<<16) + x[i];
+	for (i = 0; i < 3; i++)
+		ret = (ret << 16) + x[i];
 	return ret;
 }
 
@@ -624,17 +632,15 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 	int status = 0;
 	const char* server_url = RUFUS_URL "/";
 	int i, j, k, max_channel, verbose = 0, verpos[4];
-	static const char* archname[] = {"win_x86", "win_x64", "win_arm", "win_arm64", "win_none"};
-	static const char* channel[] = {"release", "beta", "test"};		// release channel
-	const char* accept_types[] = {"*/*\0", NULL};
+	static const char* channel[] = { "release", "beta", "test" };		// release channel
+	const char* accept_types[] = { "*/*\0", NULL };
 	char* buf = NULL;
 	char agent[64], hostname[64], urlpath[128], sigpath[256];
 	DWORD dwSize, dwDownloaded, dwTotalSize, dwStatus;
 	BYTE *sig = NULL;
-	OSVERSIONINFOA os_version = {sizeof(OSVERSIONINFOA), 0, 0, 0, 0, ""};
 	HINTERNET hSession = NULL, hConnection = NULL, hRequest = NULL;
-	URL_COMPONENTSA UrlParts = {sizeof(URL_COMPONENTSA), NULL, 1, (INTERNET_SCHEME)0,
-		hostname, sizeof(hostname), 0, NULL, 1, urlpath, sizeof(urlpath), NULL, 1};
+	URL_COMPONENTSA UrlParts = { sizeof(URL_COMPONENTSA), NULL, 1, (INTERNET_SCHEME)0,
+		hostname, sizeof(hostname), 0, NULL, 1, urlpath, sizeof(urlpath), NULL, 1 };
 	SYSTEMTIME ServerTime, LocalTime;
 	FILETIME FileTime;
 	int64_t local_time = 0, reg_time, server_time, update_interval;
@@ -663,7 +669,7 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 		// It would of course be a lot nicer to use a timer and wake the thread, but my
 		// development time is limited and this is FASTER to implement.
 		do {
-			for (i=0; (i<30) && (!force_update_check); i++)
+			for (i = 0; ( i < 30) && (!force_update_check); i++)
 				Sleep(500);
 		} while ((!force_update_check) && ((op_in_progress || (dialog_showing > 0))));
 		if (!force_update_check) {
@@ -680,7 +686,7 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 			GetSystemTime(&LocalTime);
 			if (!SystemTimeToFileTime(&LocalTime, &FileTime))
 				goto out;
-			local_time = ((((int64_t)FileTime.dwHighDateTime)<<32) + FileTime.dwLowDateTime) / 10000000;
+			local_time = ((((int64_t)FileTime.dwHighDateTime) << 32) + FileTime.dwLowDateTime) / 10000000;
 			vvuprintf("Local time: %" PRId64, local_time);
 			if (local_time < reg_time + update_interval) {
 				vuprintf("Next update check in %" PRId64 " seconds.", reg_time + update_interval - local_time);
@@ -692,28 +698,24 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 	PrintInfoDebug(3000, MSG_243);
 	status++;	// 1
 
-	if (!GetVersionExA(&os_version)) {
-		uprintf("Could not read Windows version - Check for updates cancelled.");
-		goto out;
-	}
-
 	if (!pfInternetCrackUrlA(server_url, (DWORD)safe_strlen(server_url), 0, &UrlParts))
 		goto out;
 	hostname[sizeof(hostname)-1] = 0;
 
-	static_sprintf(agent, APPLICATION_NAME "/%d.%d.%d (Windows NT %d.%d%s)",
+	static_sprintf(agent, APPLICATION_NAME "/%d.%d.%d (Windows NT %lu.%lu%s)",
 		rufus_version[0], rufus_version[1], rufus_version[2],
-		nWindowsVersion >> 4, nWindowsVersion & 0x0F, is_x64() ? "; WOW64" : "");
+		WindowsVersion.Major, WindowsVersion.Minor, is_WOW64() ? "; WOW64" : "");
 	hSession = GetInternetSession(FALSE);
 	if (hSession == NULL)
 		goto out;
-	hConnection = pfInternetConnectA(hSession, UrlParts.lpszHostName, UrlParts.nPort, NULL, NULL, INTERNET_SERVICE_HTTP, 0, (DWORD_PTR)NULL);
+	hConnection = pfInternetConnectA(hSession, UrlParts.lpszHostName, UrlParts.nPort,
+		NULL, NULL, INTERNET_SERVICE_HTTP, 0, (DWORD_PTR)NULL);
 	if (hConnection == NULL)
 		goto out;
 
 	status++;	// 2
-	// BETAs are only made available for x86_32
-	if (is_x86_32)
+	// BETAs are only made available when the application arch is x86_64
+	if (is_x86_64)
 		releases_only = !ReadSettingBool(SETTING_INCLUDE_BETAS);
 
 	// Test releases get their own distribution channel (and also force beta checks)
@@ -723,7 +725,7 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 	max_channel = releases_only ? 1 : (int)ARRAYSIZE(channel) - 1;
 #endif
 	vuprintf("Using %s for the update check", RUFUS_URL);
-	for (k=0; (k<max_channel) && (!found_new_version); k++) {
+	for (k = 0; (k < max_channel) && (!found_new_version); k++) {
 		// Free any previous buffers we might have used
 		safe_free(buf);
 		safe_free(sig);
@@ -733,10 +735,11 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 		// and then remove each of the <os_> components until we find our match. For instance, we may first
 		// look for rufus_win_x64_6.2.ver (Win8 x64) but only get a match for rufus_win_x64_6.ver (Vista x64 or later)
 		// This allows sunsetting OS versions (eg XP) or providing different downloads for different archs/groups.
-		static_sprintf(urlpath, "%s%s%s_%s_%lu.%lu.ver", APPLICATION_NAME, (k==0)?"":"_",
-			(k==0)?"":channel[k], archname[GetCpuArch()], os_version.dwMajorVersion, os_version.dwMinorVersion);
+		// Note that for BETAs, we only catter for x64 regardless of the OS arch.
+		static_sprintf(urlpath, "%s%s%s_win_%s_%lu.%lu.ver", APPLICATION_NAME, (k == 0) ? "": "_",
+			(k == 0) ? "" : channel[k], GetArchName(WindowsVersion.Arch), WindowsVersion.Major, WindowsVersion.Minor);
 		vuprintf("Base update check: %s", urlpath);
-		for (i=0, j=(int)safe_strlen(urlpath)-5; (j>0)&&(i<ARRAYSIZE(verpos)); j--) {
+		for (i = 0, j = (int)safe_strlen(urlpath) - 5; (j > 0) && (i < ARRAYSIZE(verpos)); j--) {
 			if ((urlpath[j] == '.') || (urlpath[j] == '_')) {
 				verpos[i++] = j;
 			}
@@ -768,7 +771,7 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 		}
 		if (dwStatus != 200) {
 			vuprintf("Could not find a %s version file on server %s", channel[k], server_url);
-			if ((releases_only) || (k+1 >= ARRAYSIZE(channel)))
+			if ((releases_only) || (k + 1 >= ARRAYSIZE(channel)))
 				goto out;
 			continue;
 		}
@@ -782,14 +785,15 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 		if ( (!pfHttpQueryInfoA(hRequest, HTTP_QUERY_DATE|HTTP_QUERY_FLAG_SYSTEMTIME, (LPVOID)&ServerTime, &dwSize, NULL))
 			|| (!SystemTimeToFileTime(&ServerTime, &FileTime)) )
 			goto out;
-		server_time = ((((int64_t)FileTime.dwHighDateTime)<<32) + FileTime.dwLowDateTime) / 10000000;
+		server_time = ((((int64_t)FileTime.dwHighDateTime) << 32) + FileTime.dwLowDateTime) / 10000000;
 		vvuprintf("Server time: %" PRId64, server_time);
 		// Always store the server response time - the only clock we trust!
 		WriteSetting64(SETTING_LAST_UPDATE, server_time);
 		// Might as well let the user know
 		if (!force_update_check) {
 			if ((local_time > server_time + 600) || (local_time < server_time - 600)) {
-				uprintf("IMPORTANT: Your local clock is more than 10 minutes in the %s. Unless you fix this, " APPLICATION_NAME " may not be able to check for updates...",
+				uprintf("IMPORTANT: Your local clock is more than 10 minutes in the %s. Unless you fix this, "
+					APPLICATION_NAME " may not be able to check for updates...",
 					(local_time > server_time + 600)?"future":"past");
 			}
 		}
@@ -799,7 +803,7 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 			goto out;
 
 		// Make sure the file is NUL terminated
-		buf = (char*)calloc(dwTotalSize+1, 1);
+		buf = (char*)calloc(dwTotalSize + 1, 1);
 		if (buf == NULL)
 			goto out;
 		// This is a version file - we should be able to gulp it down in one go
@@ -825,8 +829,8 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 		vuprintf("  url: %s", update.download_url);
 
 		found_new_version = ((to_uint64_t(update.version) > to_uint64_t(rufus_version)) || (force_update))
-			&& ((os_version.dwMajorVersion > update.platform_min[0])
-				|| ((os_version.dwMajorVersion == update.platform_min[0]) && (os_version.dwMinorVersion >= update.platform_min[1])));
+			&& ((WindowsVersion.Major > update.platform_min[0])
+				|| ((WindowsVersion.Major == update.platform_min[0]) && (WindowsVersion.Minor >= update.platform_min[1])));
 		uprintf("N%sew %s version found%c", found_new_version ? "" : "o n", channel[k], found_new_version ? '!' : '.');
 	}
 
@@ -942,7 +946,7 @@ static DWORD WINAPI DownloadISOThread(LPVOID param)
 		free(sig);
 		uprintf("Download signature is valid ✓");
 		uncompressed_size = *((uint64_t*)&compressed[5]);
-		if ((uncompressed_size < 1 * MB) && (bled_init(_uprintf, NULL, NULL, NULL, NULL, &FormatStatus) >= 0)) {
+		if ((uncompressed_size < 1 * MB) && (bled_init(uprintf, NULL, NULL, NULL, NULL, &FormatStatus) >= 0)) {
 			fido_script = malloc((size_t)uncompressed_size);
 			size = bled_uncompress_from_buffer_to_buffer(compressed, dwCompressedSize, fido_script, (size_t)uncompressed_size, BLED_COMPRESSION_LZMA);
 			bled_exit();
@@ -981,17 +985,17 @@ static DWORD WINAPI DownloadISOThread(LPVOID param)
 	safe_closehandle(hFile);
 #endif
 	static_sprintf(powershell_path, "%s\\WindowsPowerShell\\v1.0\\powershell.exe", system_dir);
-	static_sprintf(locale_str, "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
+	static_sprintf(locale_str, "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
 		selected_locale->txt[0], lmprintf(MSG_135), lmprintf(MSG_136), lmprintf(MSG_137),
 		lmprintf(MSG_138), lmprintf(MSG_139), lmprintf(MSG_040), lmprintf(MSG_140), lmprintf(MSG_141),
 		lmprintf(MSG_006), lmprintf(MSG_007), lmprintf(MSG_042), lmprintf(MSG_142), lmprintf(MSG_143),
-		lmprintf(MSG_144), lmprintf(MSG_145), lmprintf(MSG_146));
+		lmprintf(MSG_144), lmprintf(MSG_145), lmprintf(MSG_146), lmprintf(MSG_199));
 
 	hPipe = CreateNamedPipeA(pipe, PIPE_ACCESS_INBOUND,
 		PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
 		dwPipeSize, dwPipeSize, 0, NULL);
 	if (hPipe == INVALID_HANDLE_VALUE) {
-		uprintf("Could not create pipe '%s': %s", pipe, WindowsErrorString);
+		uprintf("Could not create pipe '%s': %s", pipe, WindowsErrorString());
 		goto out;
 	}
 
@@ -999,6 +1003,7 @@ static DWORD WINAPI DownloadISOThread(LPVOID param)
 		"-File \"%s\" -PipeName %s -LocData \"%s\" -Icon \"%s\" -AppTitle \"%s\"",
 		powershell_path, script_path, &pipe[9], locale_str, icon_path, lmprintf(MSG_149));
 
+#ifndef RUFUS_TEST
 	// For extra security, even after we validated that the LZMA download is properly
 	// signed, we also validate the Authenticode signature of the local script.
 	if (ValidateSignature(INVALID_HANDLE_VALUE, script_path) != NO_ERROR) {
@@ -1009,6 +1014,7 @@ static DWORD WINAPI DownloadISOThread(LPVOID param)
 		goto out;
 	}
 	uprintf("Script signature is valid ✓");
+#endif
 
 	dwExitCode = RunCommand(cmdline, app_data_dir, TRUE);
 	uprintf("Exited download script with code: %d", dwExitCode);

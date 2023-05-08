@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Standard Windows function calls
- * Copyright © 2013-2021 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2023 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -34,10 +34,7 @@
 
 #include "settings.h"
 
-int nWindowsVersion = WINDOWS_UNDEFINED;
-int nWindowsBuildNumber = -1;
-int nWindowsEdition = 0;
-char WindowsVersionStr[128] = "Windows ";
+windows_version_t WindowsVersion = { 0 };
 
 /*
  * Hash table functions - modified From glibc 2.3.2:
@@ -207,40 +204,6 @@ uint32_t htab_hash(char* str, htab_table* htab)
 	return idx;
 }
 
-BOOL is_x64(void)
-{
-	BOOL ret = FALSE;
-	PF_TYPE_DECL(WINAPI, BOOL, IsWow64Process, (HANDLE, PBOOL));
-	// Detect if we're running a 32 or 64 bit system
-	if (sizeof(uintptr_t) < 8) {
-		PF_INIT(IsWow64Process, Kernel32);
-		if (pfIsWow64Process != NULL) {
-			(*pfIsWow64Process)(GetCurrentProcess(), &ret);
-		}
-	} else {
-		ret = TRUE;
-	}
-	return ret;
-}
-
-int GetCpuArch(void)
-{
-	SYSTEM_INFO info = { 0 };
-	GetNativeSystemInfo(&info);
-	switch (info.wProcessorArchitecture) {
-	case PROCESSOR_ARCHITECTURE_AMD64:
-		return CPU_ARCH_X86_64;
-	case PROCESSOR_ARCHITECTURE_INTEL:
-		return CPU_ARCH_X86_64;
-	case PROCESSOR_ARCHITECTURE_ARM64:
-		return CPU_ARCH_ARM_64;
-	case PROCESSOR_ARCHITECTURE_ARM:
-		return CPU_ARCH_ARM_32;
-	default:
-		return CPU_ARCH_UNDEFINED;
-	}
-}
-
 static const char* GetEdition(DWORD ProductType)
 {
 	static char unknown_edition_str[64];
@@ -343,20 +306,24 @@ static const char* GetEdition(DWORD ProductType)
 /*
  * Modified from smartmontools' os_win32.cpp
  */
-void GetWindowsVersion(void)
+void GetWindowsVersion(windows_version_t* windows_version)
 {
 	OSVERSIONINFOEXA vi, vi2;
 	DWORD dwProductType = 0;
-	const char* w = 0;
-	const char* w64 = "32 bit";
+	const char* w = NULL;
+	const char* arch_name;
 	char *vptr;
 	size_t vlen;
-	unsigned major, minor;
+	DWORD major = 0, minor = 0;
+	USHORT ProcessMachine = IMAGE_FILE_MACHINE_UNKNOWN, NativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
 	ULONGLONG major_equal, minor_equal;
-	BOOL ws;
+	BOOL ws, is_wow64 = FALSE;
 
-	nWindowsVersion = WINDOWS_UNDEFINED;
-	static_strcpy(WindowsVersionStr, "Windows Undefined");
+	PF_TYPE_DECL(WINAPI, BOOL, IsWow64Process2, (HANDLE, USHORT*, USHORT*));
+	PF_INIT(IsWow64Process2, Kernel32);
+
+	memset(windows_version, 0, sizeof(windows_version_t));
+	static_strcpy(windows_version->VersionStr, "Windows Undefined");
 
 	memset(&vi, 0, sizeof(vi));
 	vi.dwOSVersionInfoSize = sizeof(vi);
@@ -401,8 +368,8 @@ void GetWindowsVersion(void)
 
 		if (vi.dwMajorVersion <= 0xf && vi.dwMinorVersion <= 0xf) {
 			ws = (vi.wProductType <= VER_NT_WORKSTATION);
-			nWindowsVersion = vi.dwMajorVersion << 4 | vi.dwMinorVersion;
-			switch (nWindowsVersion) {
+			windows_version->Version = vi.dwMajorVersion << 4 | vi.dwMinorVersion;
+			switch (windows_version->Version) {
 			case WINDOWS_XP: w = "XP";
 				break;
 			case WINDOWS_2003: w = (ws ? "XP_64" : (!GetSystemMetrics(89) ? "Server 2003" : "Server 2003_R2"));
@@ -423,50 +390,66 @@ void GetWindowsVersion(void)
 					w = (ws ? "10" : ((vi.dwBuildNumber < 17763) ? "Server 2016" : "Server 2019"));
 					break;
 				}
-				nWindowsVersion = WINDOWS_11;
+				windows_version->Version = WINDOWS_11;
+				major = 11;
 				// Fall through
 			case WINDOWS_11: w = (ws ? "11" : "Server 2022");
 				break;
 			default:
-				if (nWindowsVersion < WINDOWS_XP)
-					nWindowsVersion = WINDOWS_UNSUPPORTED;
+				if (windows_version->Version < WINDOWS_XP)
+					windows_version->Version = WINDOWS_UNDEFINED;
 				else
 					w = "12 or later";
 				break;
 			}
 		}
 	}
+	windows_version->Major = major;
+	windows_version->Minor = minor;
 
-	if (is_x64())
-		w64 = "64-bit";
+	if ((pfIsWow64Process2 != NULL) && pfIsWow64Process2(GetCurrentProcess(), &ProcessMachine, &NativeMachine)) {
+		windows_version->Arch = NativeMachine;
+	} else {
+		// Assume same arch as the app
+		windows_version->Arch = GetApplicationArch();
+		// Fix the Arch if we have a 32-bit app running under WOW64
+		if ((sizeof(uintptr_t) < 8) && IsWow64Process(GetCurrentProcess(), &is_wow64) && is_wow64) {
+			if (windows_version->Arch == IMAGE_FILE_MACHINE_I386)
+				windows_version->Arch = IMAGE_FILE_MACHINE_AMD64;
+			else if (windows_version->Arch == IMAGE_FILE_MACHINE_ARM)
+				windows_version->Arch = IMAGE_FILE_MACHINE_ARM64;
+			else // I sure wanna be made aware of this scenario...
+				assert(FALSE);
+		}
+		uprintf("Note: Underlying Windows architecture was guessed and may be incorrect...");
+	}
+	arch_name = GetArchName(windows_version->Arch);
 
 	GetProductInfo(vi.dwMajorVersion, vi.dwMinorVersion, vi.wServicePackMajor, vi.wServicePackMinor, &dwProductType);
-	vptr = &WindowsVersionStr[sizeof("Windows ") - 1];
-	vlen = sizeof(WindowsVersionStr) - sizeof("Windows ") - 1;
+	vptr = &windows_version->VersionStr[sizeof("Windows ") - 1];
+	vlen = sizeof(windows_version->VersionStr) - sizeof("Windows ") - 1;
 	if (!w)
 		safe_sprintf(vptr, vlen, "%s %u.%u %s", (vi.dwPlatformId == VER_PLATFORM_WIN32_NT ? "NT" : "??"),
-			(unsigned)vi.dwMajorVersion, (unsigned)vi.dwMinorVersion, w64);
+			(unsigned)vi.dwMajorVersion, (unsigned)vi.dwMinorVersion, arch_name);
 	else if (vi.wServicePackMinor)
-		safe_sprintf(vptr, vlen, "%s SP%u.%u %s", w, vi.wServicePackMajor, vi.wServicePackMinor, w64);
+		safe_sprintf(vptr, vlen, "%s SP%u.%u %s", w, vi.wServicePackMajor, vi.wServicePackMinor, arch_name);
 	else if (vi.wServicePackMajor)
-		safe_sprintf(vptr, vlen, "%s SP%u %s", w, vi.wServicePackMajor, w64);
+		safe_sprintf(vptr, vlen, "%s SP%u %s", w, vi.wServicePackMajor, arch_name);
 	else
-		safe_sprintf(vptr, vlen, "%s%s%s, %s",
-			w, (dwProductType != 0) ? " " : "", GetEdition(dwProductType), w64);
+		safe_sprintf(vptr, vlen, "%s%s%s %s",
+			w, (dwProductType != 0) ? " " : "", GetEdition(dwProductType), arch_name);
 
-	nWindowsEdition = (int)dwProductType;
+	windows_version->Edition = (int)dwProductType;
 
-	// Add the build number (including UBR if available) for Windows 8.0 and later
-	nWindowsBuildNumber = vi.dwBuildNumber;
-	if (nWindowsVersion >= 0x62) {
-		int nUbr = ReadRegistryKey32(REGKEY_HKLM, "Software\\Microsoft\\Windows NT\\CurrentVersion\\UBR");
-		vptr = &WindowsVersionStr[safe_strlen(WindowsVersionStr)];
-		vlen = sizeof(WindowsVersionStr) - safe_strlen(WindowsVersionStr) - 1;
-		if (nUbr > 0)
-			safe_sprintf(vptr, vlen, " (Build %d.%d)", nWindowsBuildNumber, nUbr);
-		else
-			safe_sprintf(vptr, vlen, " (Build %d)", nWindowsBuildNumber);
-	}
+	// Add the build number (including UBR if available)
+	windows_version->BuildNumber = vi.dwBuildNumber;
+	windows_version->Ubr = ReadRegistryKey32(REGKEY_HKLM, "Software\\Microsoft\\Windows NT\\CurrentVersion\\UBR");
+	vptr = &windows_version->VersionStr[safe_strlen(windows_version->VersionStr)];
+	vlen = sizeof(windows_version->VersionStr) - safe_strlen(windows_version->VersionStr) - 1;
+	if (windows_version->Ubr != 0)
+		safe_sprintf(vptr, vlen, " (Build %lu.%lu)", windows_version->BuildNumber, windows_version->Ubr);
+	else
+		safe_sprintf(vptr, vlen, " (Build %lu)", windows_version->BuildNumber);
 }
 
 /*
@@ -585,17 +568,15 @@ static PSID GetSID(void) {
 	return ret;
 }
 
-/*
- * read or write I/O to a file
- * buffer is allocated by the procedure. path is UTF-8
- */
-BOOL FileIO(BOOL save, char* path, char** buffer, DWORD* size)
+BOOL FileIO(enum file_io_type io_type, char* path, char** buffer, DWORD* size)
 {
 	SECURITY_ATTRIBUTES s_attr, *sa = NULL;
 	SECURITY_DESCRIPTOR s_desc;
+	const LARGE_INTEGER liZero = { .QuadPart = 0ULL };
 	PSID sid = NULL;
 	HANDLE handle;
-	BOOL r;
+	DWORD dwDesiredAccess = 0, dwCreationDisposition = 0;
+	BOOL r = FALSE;
 	BOOL ret = FALSE;
 
 	// Change the owner from admin to regular user
@@ -611,20 +592,34 @@ BOOL FileIO(BOOL save, char* path, char** buffer, DWORD* size)
 		uprintf("Could not set security descriptor: %s\n", WindowsErrorString());
 	}
 
-	if (!save) {
+	switch (io_type) {
+	case FILE_IO_READ:
 		*buffer = NULL;
+		dwDesiredAccess = GENERIC_READ;
+		dwCreationDisposition = OPEN_EXISTING;
+		break;
+	case FILE_IO_WRITE:
+		dwDesiredAccess = GENERIC_WRITE;
+		dwCreationDisposition = CREATE_ALWAYS;
+		break;
+	case FILE_IO_APPEND:
+		dwDesiredAccess = FILE_APPEND_DATA;
+		dwCreationDisposition = OPEN_ALWAYS;
+		break;
+	default:
+		assert(FALSE);
+		break;
 	}
-	handle = CreateFileU(path, save?GENERIC_WRITE:GENERIC_READ, FILE_SHARE_READ,
-		sa, save?CREATE_ALWAYS:OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	handle = CreateFileU(path, dwDesiredAccess, FILE_SHARE_READ, sa,
+		dwCreationDisposition, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if (handle == INVALID_HANDLE_VALUE) {
-		uprintf("Could not %s file '%s'\n", save?"create":"open", path);
+		uprintf("Could not open '%s': %s", path, WindowsErrorString());
 		goto out;
 	}
 
-	if (save) {
-		r = WriteFile(handle, *buffer, *size, size, NULL);
-	} else {
+	switch (io_type) {
+	case FILE_IO_READ:
 		*size = GetFileSize(handle, NULL);
 		*buffer = (char*)malloc(*size);
 		if (*buffer == NULL) {
@@ -632,24 +627,29 @@ BOOL FileIO(BOOL save, char* path, char** buffer, DWORD* size)
 			goto out;
 		}
 		r = ReadFile(handle, *buffer, *size, size, NULL);
+		break;
+	case FILE_IO_APPEND:
+		SetFilePointerEx(handle, liZero, NULL, FILE_END);
+		// Fall through
+	case FILE_IO_WRITE:
+		r = WriteFile(handle, *buffer, *size, size, NULL);
+		break;
 	}
 
 	if (!r) {
-		uprintf("I/O Error: %s\n", WindowsErrorString());
+		uprintf("I/O Error: %s", WindowsErrorString());
 		goto out;
 	}
 
-	PrintInfoDebug(0, save?MSG_216:MSG_215, path);
+	PrintInfoDebug(0, (io_type == FILE_IO_READ) ? MSG_215 : MSG_216, path);
 	ret = TRUE;
 
 out:
 	CloseHandle(handle);
-	if (!ret) {
-		// Only leave a buffer allocated if successful
+	if (!ret && (io_type == FILE_IO_READ)) {
+		// Only leave the buffer allocated if we were able to read data
+		safe_free(*buffer);
 		*size = 0;
-		if (!save) {
-			safe_free(*buffer);
-		}
 	}
 	return ret;
 }
@@ -745,8 +745,8 @@ DWORD RunCommand(const char* cmd, const char* dir, BOOL log)
 					output = malloc(dwAvail + 1);
 					if ((output != NULL) && (ReadFile(hOutputRead, output, dwAvail, &dwRead, NULL)) && (dwRead != 0)) {
 						output[dwAvail] = 0;
-						// coverity[tainted_string]
-						uprintf(output);
+						// output may contain a '%' so don't feed it as a naked format string
+						uprintf("%s", output);
 					}
 					free(output);
 				}
@@ -1017,12 +1017,12 @@ out:
 	return r;
 }
 
-char* GetCurrentMUI(void)
+char* ToLocaleName(DWORD lang_id)
 {
 	static char mui_str[LOCALE_NAME_MAX_LENGTH];
 	wchar_t wmui_str[LOCALE_NAME_MAX_LENGTH];
 
-	if (LCIDToLocaleName(GetUserDefaultUILanguage(), wmui_str, LOCALE_NAME_MAX_LENGTH, 0) > 0) {
+	if (LCIDToLocaleName(lang_id, wmui_str, LOCALE_NAME_MAX_LENGTH, 0) > 0) {
 		wchar_to_utf8_no_alloc(wmui_str, mui_str, LOCALE_NAME_MAX_LENGTH);
 	} else {
 		static_strcpy(mui_str, "en-US");
